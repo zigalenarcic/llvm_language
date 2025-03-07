@@ -1,4 +1,5 @@
+PARAM := `llvm-config --cxxflags --ldflags --libs core`
 
-
-lang: lang.o
-	g++ -g -o $@ -Wall lang.o
+.PHONY: lang
+lang:
+	clang++ -g3 -o $@ -Wall ${PARAM} lang.cpp
