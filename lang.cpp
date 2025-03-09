@@ -1,3 +1,4 @@
+/* building IR */
 #include "llvm/ADT/APFloat.h"
 // #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -9,6 +10,19 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+/* JIT */
+#include "llvm/Support/InitLLVM.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -305,7 +319,6 @@ typedef struct AstNode {
   /* function data */
   Token function_name;
   struct AstNode *arglist;
-  llvm::Value *argValues[10];
 
   struct AstNode *next;
 } AstNode;
@@ -455,7 +468,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
       case TOK_MINUS:
         if (!expr) /* allow single argument negation */
         {
-          AstNode *node1 = ParseExpression(state, end_token, -1, 15);
+          AstNode *node1 = ParseExpression(state, end_token, end_token2, 15);
 
           if (!node1)
           {
@@ -476,7 +489,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
             return NULL;
           }
           AstNode *node1 = expr;
-          AstNode *node2 = ParseExpression(state, end_token, -1, GetPrecedence(t1.type));
+          AstNode *node2 = ParseExpression(state, end_token, end_token2, GetPrecedence(t1.type));
 
           if (!node2)
           {
@@ -723,100 +736,244 @@ void FreeAstNode(AstNode *node)
 }
 
 using namespace llvm;
+using namespace llvm::orc;
 
-LLVMContext *context;
-Module *mod;
-IRBuilder<> *builder;
-Type *i64_type;
+std::unique_ptr<FunctionPassManager> TheFPM;
+std::unique_ptr<LoopAnalysisManager> TheLAM;
+std::unique_ptr<FunctionAnalysisManager> TheFAM;
+std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
+std::unique_ptr<ModuleAnalysisManager> TheMAM;
+std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
+std::unique_ptr<StandardInstrumentations> TheSI;
 
-Value *GenerateCode(AstNode *node, AstNode *func)
+typedef enum {
+  TYPE_NONE = 0,
+  TYPE_I64,
+  TYPE_U64,
+  TYPE_F64,
+} ETypes;
+
+typedef struct FunctionDeclaration {
+  char name[128];
+  ETypes return_type;
+  std::vector<ETypes> arg_types;
+} FunctionDeclaration;
+
+Type *LlvmType(ETypes type, LLVMContext *context)
+{
+  switch (type)
+  {
+    case TYPE_NONE:
+      return NULL;
+      break;
+    case TYPE_I64:
+    case TYPE_U64:
+    default:
+      return Type::getInt64Ty(*context);
+      break;
+    case TYPE_F64:
+      return Type::getDoubleTy(*context);
+      break;
+  }
+}
+
+const char *TypeToString(ETypes type)
+{
+  switch (type)
+  {
+    case TYPE_NONE: return "NONE";
+    case TYPE_I64: return "I64";
+    case TYPE_U64: return "U64";
+    case TYPE_F64: return "F64";
+    default: return "UNKNOWN";
+  }
+}
+
+void PrintFunctionDeclaration(FunctionDeclaration *fun_decl)
+{
+  printf("Function: \"%s\" %s(", fun_decl->name, TypeToString(fun_decl->return_type));
+  for (int i = 0; i < fun_decl->arg_types.size(); i++)
+  {
+    printf(i == 0 ? "%s" : " %s", TypeToString(fun_decl->arg_types[i]));
+  }
+  printf(")\n");
+}
+
+Function *AddFunctionDeclaration(FunctionDeclaration *fun_decl, LLVMContext *context, Module *mod)
+{
+  printf("Adding function declaration: ");
+  PrintFunctionDeclaration(fun_decl);
+
+  std::vector<Type *> types;
+  for (auto &a : fun_decl->arg_types)
+  {
+    types.push_back(LlvmType(a, context));
+  }
+  FunctionType *ft = FunctionType::get(LlvmType(fun_decl->return_type, context), types, false);
+  //Function *f = mod->getFunction(node->function_name.string);
+  Function *f = Function::Create(ft, Function::ExternalLinkage, fun_decl->name, *mod);
+
+  return f;
+}
+
+typedef struct CompileEnvironment {
+  std::unique_ptr<LLVMContext> context;
+  IRBuilder<> *builder;
+  std::unique_ptr<Module> mod;
+
+  char module_name[64];
+  char toplevel_function_name[64];
+
+  std::vector<FunctionDeclaration> function_declarations;
+} CompileEnvironment;
+
+typedef struct Scope {
+  std::vector<Value *> values;
+  std::vector<char *> names;
+} Scope;
+
+Value *FindVar(Scope *scope, const char *name)
+{
+  if (!scope)
+  {
+    return NULL;
+  }
+
+  for (int i = scope->names.size() - 1; i >= 0; i--)
+  {
+    if (strcmp(scope->names[i], name) == 0)
+    {
+      return scope->values[i];
+    }
+  }
+
+  return NULL;
+}
+
+Value *GenerateIr(AstNode *node, Scope *scope, bool toplevel, CompileEnvironment *cenv);
+
+Value *GenerateIrList(AstNode *node, Scope *scope, bool toplevel, CompileEnvironment *cenv)
+{
+  Value *ret_val = NULL;
+  while (node)
+  {
+    ret_val = GenerateIr(node, scope, toplevel, cenv);
+    node = node->next;
+  }
+
+  return ret_val;
+}
+
+Value *GenerateIr(AstNode *node, Scope *scope, bool toplevel, CompileEnvironment *cenv)
 {
   switch (node->type)
   {
     case NODE_INTEGER:
-      return ConstantInt::get(i64_type, node->token.integer, false);
+      return ConstantInt::get(Type::getInt64Ty(*cenv->context), node->token.integer, false);
       break;
     case NODE_FLOAT:
-      return ConstantFP::get(*context, APFloat(node->token.floatval));
+      return ConstantFP::get(*cenv->context, APFloat(node->token.floatval));
       break;
     case NODE_ADD:
     case NODE_MULTIPLY:
     case NODE_SUBTRACT:
     case NODE_DIVIDE:
       {
-        Value *a = GenerateCode(node->args, func);
-        Value *b = GenerateCode(node->args->next, func);
+        Value *a = GenerateIr(node->args, scope, toplevel, cenv);
+        Value *b = GenerateIr(node->args->next, scope, toplevel, cenv);
         if (node->type == NODE_ADD)
-          return builder->CreateAdd(a, b);
+          return cenv->builder->CreateAdd(a, b);
         else if (node->type == NODE_MULTIPLY)
-          return builder->CreateMul(a, b);
+          return cenv->builder->CreateMul(a, b);
         else if (node->type == NODE_SUBTRACT)
-          return builder->CreateSub(a, b);
+          return cenv->builder->CreateSub(a, b);
         else if (node->type == NODE_DIVIDE)
-          return builder->CreateSDiv(a, b);
+          return cenv->builder->CreateSDiv(a, b);
       }
       break;
     case NODE_IDENTIFIER:
       {
-        /* return value for the argument */
-        if (func)
+        return FindVar(scope, node->token.string);
+      }
+      break;
+    case NODE_FUNCALL:
+      {
+        Function *f = cenv->mod->getFunction(node->token.string);
+        if (f)
         {
-          AstNode *arg = func->arglist;
-          int i = 0;
-          //printf("Searching identifier %s\n", node->token.string);
-          while (arg)
+          std::vector<Value *> args;
+          AstNode *n = node->args;
+          while (n)
           {
-            if (strcmp(arg->token.string, node->token.string) == 0)
-            {
-              //printf("Found argument %d\n", i);
-              return func->argValues[i];
-            }
-            arg = arg->next;
-            i++;
+            args.push_back(GenerateIr(n, scope, toplevel, cenv));
+            n = n->next;
           }
+
+          //cenv->builder->CreateCall(f->getFunctionType(), NULL, args);
+          return cenv->builder->CreateCall(f, args);
         }
         else
         {
+          printf("Error: no function for name \"%s\" found, can't emit function call\n", node->token.string);
           return NULL;
         }
       }
       break;
     case NODE_DEF:
       {
-        std::vector<Type *> types;
+        //std::vector<Type *> types;
         /* create vector with types */
-        //types.push_back(Type::getDoubleTy(*context));
+        //types.push_back(Type::getDoubleTy(*cenv->context));
         AstNode *arg = node->arglist;
+        
+        FunctionDeclaration fun_decl;
+        strcpy(fun_decl.name, node->function_name.string);
+        fun_decl.return_type = TYPE_I64;
+
         while (arg)
         {
-          types.push_back(Type::getInt64Ty(*context));
+          //types.push_back(Type::getInt64Ty(*cenv->context));
           arg = arg->next;
+          fun_decl.arg_types.push_back(TYPE_I64);
         }
-        FunctionType *ft = FunctionType::get(Type::getInt64Ty(*context), types, false);
-        //Function *f = mod->getFunction(node->function_name.string);
-        Function *f = Function::Create(ft, Function::ExternalLinkage, node->function_name.string, *mod);
-        BasicBlock *block = BasicBlock::Create(*context, "funbody", f);
-        builder->SetInsertPoint(block);
+        //FunctionType *ft = FunctionType::get(Type::getInt64Ty(*cenv->context) /*return*/, types, false);
+        //Function *f = cenv->mod->getFunction(node->function_name.string);
 
+        Function *f = AddFunctionDeclaration(&fun_decl, cenv->context.get(), cenv->mod.get());
+        BasicBlock *block = BasicBlock::Create(*cenv->context, "body", f);
+        auto previous_insert = cenv->builder->saveIP();
+        cenv->builder->SetInsertPoint(block);
+        cenv->function_declarations.push_back(fun_decl);
+
+        Scope s;
         {
-          int i = 0;
           AstNode *arg = node->arglist;
           for (auto &a : f->args())
           {
             /* get Value types for arguments */
             a.setName(arg->token.string);
+
+            s.values.push_back(&a);
+            s.names.push_back(arg->token.string);
+
             arg = arg->next;
-            node->argValues[i++] = &a;
           }
         }
 
-        Value *ret_val = GenerateCode(node->args, node);
+        /* generate IR for the function body */
+        Value *ret_val = GenerateIrList(node->args, &s, false, cenv);
         if (ret_val)
         {
-          builder->CreateRet(ret_val);
+          cenv->builder->CreateRet(ret_val);
           verifyFunction(*f);
+
+          /* optimize code */
+#if 0
+          TheFPM->run(*f, *TheFAM);
+#endif
         }
         f->print(errs());
+        cenv->builder->restoreIP(previous_insert);
 
       }
       break;
@@ -827,16 +984,51 @@ Value *GenerateCode(AstNode *node, AstNode *func)
 
 int main(int argc, char *argv[])
 {
-  /* init LLVM */
-  context = new LLVMContext();
-  mod = new Module("mod01", *context);
-  builder = new IRBuilder<>(*context);
+  InitLLVM raii_1(argc, argv); /* helper class for stacktrace, utf-8 argv etc. */
 
-  i64_type = IntegerType::getInt64Ty(*context);
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  // llvm::InitializeNativeTargetDisassmebler();
+
+  auto jit = LLJITBuilder().create();
+
+  /* optimization passes */
+#if 0
+  {
+    TheFPM = std::make_unique<FunctionPassManager>();
+    TheLAM = std::make_unique<LoopAnalysisManager>();
+    TheFAM = std::make_unique<FunctionAnalysisManager>();
+    TheCGAM = std::make_unique<CGSCCAnalysisManager>();
+    TheMAM = std::make_unique<ModuleAnalysisManager>();
+    ThePIC = std::make_unique<PassInstrumentationCallbacks>();
+    TheSI = std::make_unique<StandardInstrumentations>(*cenv->context, /*DebugLogging*/ true);
+
+    TheSI->registerCallbacks(*ThePIC, TheMAM.get());
+
+    // Do simple "peephole" optimizations and bit-twiddling optzns.
+    TheFPM->addPass(InstCombinePass());
+    // Reassociate expressions.
+    TheFPM->addPass(ReassociatePass());
+    // Eliminate Common SubExpressions.
+    TheFPM->addPass(GVNPass());
+    // Simplify the control flow graph (deleting unreachable blocks, etc).
+    TheFPM->addPass(SimplifyCFGPass());
+
+    // Register analysis passes used in these transform passes.
+    PassBuilder PB;
+    PB.registerModuleAnalyses(*TheMAM);
+    PB.registerFunctionAnalyses(*TheFAM);
+    PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
+  }
+#endif
+
+  int inputi = -1;
+  CompileEnvironment cenv;
 
   while (true)
   {
     printf("> "); fflush(stdin);
+    inputi++;
 
     char line[1024];
     if (fgets(line, sizeof(line), stdin) == NULL)
@@ -848,13 +1040,61 @@ int main(int argc, char *argv[])
 
     InitParser(&tokenizer_state);
     AstNode *node = ParseToplevel(&tokenizer_state);
-
-#if 1
-    GenerateCode(node, NULL);
-    //mod->print(errs(), nullptr);
-#endif
-
     PrintAstNode(node);
+
+    /* compile */
+    /* create module for this compilation unit */
+    snprintf(cenv.module_name, sizeof(cenv.module_name), "mod%02i", inputi);
+    snprintf(cenv.toplevel_function_name, sizeof(cenv.toplevel_function_name), "mod%02i_toplevel", inputi);
+
+    /* init LLVM */
+    cenv.context = std::make_unique<LLVMContext>(); /* 1 obj per thread */
+    cenv.builder = new IRBuilder<>(*cenv.context);
+    cenv.mod = std::make_unique<Module>(cenv.module_name, *cenv.context);
+
+    /* add existing function declarations */
+    for (auto &a : cenv.function_declarations)
+    {
+      AddFunctionDeclaration(&a, cenv.context.get(), cenv.mod.get());
+    }
+
+    FunctionDeclaration toplevel_function;
+    strcpy(toplevel_function.name, cenv.toplevel_function_name);
+    toplevel_function.return_type = TYPE_I64;
+
+    Function *f = AddFunctionDeclaration(&toplevel_function, cenv.context.get(), cenv.mod.get());
+    BasicBlock *block = BasicBlock::Create(*cenv.context, "body", f);
+    cenv.builder->SetInsertPoint(block);
+
+    Value *ret_val = GenerateIrList(node, NULL, true, &cenv);
+
+    if (ret_val)
+    {
+      cenv.builder->CreateRet(ret_val);
+      verifyFunction(*f);
+
+      /* optimize code */
+#if 0
+      TheFPM->run(*f, *TheFAM);
+#endif
+    }
+    else
+    {
+      cenv.builder->CreateRet(ConstantInt::get(Type::getInt64Ty(*cenv.context), 0, false));
+      verifyFunction(*f);
+    }
+    f->print(errs());
+
+    auto r1 = jit->get()->addIRModule(ThreadSafeModule(std::move(cenv.mod), std::move(cenv.context)));
+
+    auto func_addr = jit->get()->lookup(cenv.toplevel_function_name);
+    if (func_addr)
+    {
+      i64 (*fun)() = func_addr->toPtr<i64()>();
+      i64 code_result = fun();
+      printf("Result = %ld\n", code_result);
+    }
+
     FreeAstNode(node);
   }
 
