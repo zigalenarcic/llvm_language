@@ -27,6 +27,9 @@
 #include <cstdarg>
 #include <cstring>
 #include <cmath>
+#include <sys/mman.h>
+
+#include <vector>
 
 typedef char i8;
 typedef unsigned char u8;
@@ -61,8 +64,6 @@ enum
   TOK_COMMA,
   TOK_COLON,
   TOK_SEMICOLON,
-
-  TOK_DEF,
 };
 
 typedef struct Token_
@@ -160,7 +161,6 @@ struct
   int type;
 } specializations[] =
 {
-  { "def", TOK_DEF },
 };
 
 bool SpecalizeIdentifier(Token *t)
@@ -307,18 +307,18 @@ enum {
   NODE_DIVIDE,
   NODE_NEGATE,
 
-  NODE_DEF,
-  NODE_LIST,
+  NODE_FUNCTION_DEFINITION,
+  NODE_ASSIGN,
 };
 
 typedef struct AstNode {
   int type;
   Token token;
   struct AstNode *args;
+  struct AstNode *args2; /* second part of data - function body etc. */
 
   /* function data */
   Token function_name;
-  struct AstNode *arglist;
 
   struct AstNode *next;
 } AstNode;
@@ -438,31 +438,50 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
 
     switch (t1.type)
     {
-      case TOK_DEF:
+      case TOK_EQUALS:
         {
-          Token t2 = PopToken(state);
-          if (t2.type != TOK_IDENTIFIER)
+          if (!expr)
           {
-            IntepreterError(state, t2.pos, "Missing identifier\n");
+            IntepreterError(state, t1.pos, "Unexpected token\n");
+            return NULL;
           }
-          expr = MakeAstNode(NODE_DEF, t1);
-          expr->function_name = t2;
 
-          Token t3 = PopToken(state);
-          if (t3.type != TOK_LEFT_PAREN)
+          if (expr->type == NODE_IDENTIFIER)
           {
-            IntepreterError(state, t3.pos, "Missing left parenthesis\n");
+            AstNode *ret = MakeAstNode(NODE_ASSIGN, t1);
+            ret->args = expr;
+            expr = ret;
+            expr->args2 = ParseExpression(state, TOK_SEMICOLON, -1, 0);
           }
-          ParseList(&expr->arglist, state, TOK_COMMA, TOK_RIGHT_PAREN);
-
-          Token t4 = PopToken(state);
-          if (t4.type != TOK_LEFT_BRACE)
+          else if (expr->type == NODE_FUNCALL)
           {
-            IntepreterError(state, t4.pos, "Missing left brace\n");
-          }
-          ParseBody(&expr->args, state);
+            for (AstNode *node = expr->args; node; node = node->next)
+            {
+              if (node->type != NODE_IDENTIFIER)
+              {
+                IntepreterError(state, node->token.pos, "In function definition argument must be a variable\n");
+                return NULL;
+              }
+            }
 
-          return expr;
+            expr->type = NODE_FUNCTION_DEFINITION;
+            expr->function_name = expr->token;
+
+            Token t3 = PeekToken(state);
+
+            if (t3.type == TOK_LEFT_BRACE)
+            {
+              PopToken(state);
+              /* function definition */
+              ParseBody(&expr->args2, state);
+            }
+            else
+            {
+              expr->args2 = ParseExpression(state, TOK_SEMICOLON, -1, 0);
+            }
+            return expr;
+          }
+
         }
         break;
       case TOK_MINUS:
@@ -674,8 +693,8 @@ const char *StringType(int type)
     case NODE_DIVIDE: return "DIVIDE";
     case NODE_NEGATE: return "NEGATE";
     case NODE_IDENTIFIER: return "IDENTIFIER";
-    case NODE_DEF: return "DEF";
-    case NODE_LIST: return "LIST OF";
+    case NODE_FUNCTION_DEFINITION: return "FUNCTION_DEFINITION";
+    case NODE_ASSIGN: return "ASSIGN";
   }
   return "?";
 }
@@ -690,26 +709,38 @@ void PrintAstNode1(AstNode *node, int level)
     switch (node->type)
     {
       case NODE_INTEGER:
-        printf(" value %lu", node->token.integer);
+        printf(" value %lu\n", node->token.integer);
         break;
       case NODE_FLOAT:
-        printf(" value %f", node->token.floatval);
+        printf(" value %f\n", node->token.floatval);
         break;
       case NODE_IDENTIFIER:
-        printf(" value %s", node->token.string);
+        printf(" value %s\n", node->token.string);
         break;
-      case NODE_DEF:
-        printf(" function name \"%s\" arglist:\n", node->function_name.string);
-        if (node->arglist)
-          PrintAstNode1(node->arglist, level + 1);
+      case NODE_ASSIGN:
+        printf(" var:\n");
+        if (node->args)
+          PrintAstNode1(node->args, level + 1);
+        printf(" value:\n");
+        if (node->args2)
+          PrintAstNode1(node->args2, level + 1);
+        break;
+      case NODE_FUNCTION_DEFINITION:
+        printf(" function name \"%s\" args:\n", node->function_name.string);
+        if (node->args)
+          PrintAstNode1(node->args, level + 1);
         for (int i = 0; i < level; i++)
           printf("  ");
-        printf("    function body:");
+        printf("    function body:\n");
+        if (node->args2)
+          PrintAstNode1(node->args2, level + 1);
+        break;
+      default:
+        printf("\n");
+        if (node->args)
+          PrintAstNode1(node->args, level + 1);
         break;
     }
-    printf("\n");
-    if (node->args)
-      PrintAstNode1(node->args, level + 1);
 
     node = node->next;
   }
@@ -726,6 +757,9 @@ void FreeAstNode(AstNode *node)
   {
     if (node->args)
       FreeAstNode(node->args);
+
+    if (node->args2)
+      FreeAstNode(node->args2);
 
     AstNode *next = node->next;
 
@@ -757,6 +791,7 @@ typedef struct FunctionDeclaration {
   char name[128];
   ETypes return_type;
   std::vector<ETypes> arg_types;
+  int iteration;
 } FunctionDeclaration;
 
 Type *LlvmType(ETypes type, LLVMContext *context)
@@ -825,6 +860,8 @@ typedef struct CompileEnvironment {
   char toplevel_function_name[64];
 
   std::vector<FunctionDeclaration> function_declarations;
+
+  std::vector<std::pair<char *, char *>> patches;
 } CompileEnvironment;
 
 typedef struct Scope {
@@ -919,21 +956,25 @@ Value *GenerateIr(AstNode *node, Scope *scope, bool toplevel, CompileEnvironment
         }
       }
       break;
-    case NODE_DEF:
+    case NODE_FUNCTION_DEFINITION:
       {
-        //std::vector<Type *> types;
-        /* create vector with types */
-        //types.push_back(Type::getDoubleTy(*cenv->context));
-        AstNode *arg = node->arglist;
-        
         FunctionDeclaration fun_decl;
+        fun_decl.iteration = 0;
         strcpy(fun_decl.name, node->function_name.string);
+        for (auto &a : cenv->function_declarations)
+        {
+          if (strcmp(a.name, node->function_name.string) == 0)
+          {
+            snprintf(fun_decl.name, sizeof(fun_decl.name), "%s_%d", node->function_name.string, a.iteration++);
+            cenv->patches.push_back(std::make_pair(strdup(a.name), strdup(fun_decl.name)));
+            break;
+          }
+        }
         fun_decl.return_type = TYPE_I64;
 
-        while (arg)
+        for (AstNode *arg = node->args; arg; arg = arg->next)
         {
           //types.push_back(Type::getInt64Ty(*cenv->context));
-          arg = arg->next;
           fun_decl.arg_types.push_back(TYPE_I64);
         }
         //FunctionType *ft = FunctionType::get(Type::getInt64Ty(*cenv->context) /*return*/, types, false);
@@ -947,7 +988,7 @@ Value *GenerateIr(AstNode *node, Scope *scope, bool toplevel, CompileEnvironment
 
         Scope s;
         {
-          AstNode *arg = node->arglist;
+          AstNode *arg = node->args;
           for (auto &a : f->args())
           {
             /* get Value types for arguments */
@@ -961,7 +1002,7 @@ Value *GenerateIr(AstNode *node, Scope *scope, bool toplevel, CompileEnvironment
         }
 
         /* generate IR for the function body */
-        Value *ret_val = GenerateIrList(node->args, &s, false, cenv);
+        Value *ret_val = GenerateIrList(node->args2, &s, false, cenv);
         if (ret_val)
         {
           cenv->builder->CreateRet(ret_val);
@@ -1087,10 +1128,49 @@ int main(int argc, char *argv[])
 
     auto r1 = jit->get()->addIRModule(ThreadSafeModule(std::move(cenv.mod), std::move(cenv.context)));
 
+    for (auto &a : cenv.patches)
+    {
+      printf("Patching %s -> %s\n", a.first, a.second);
+      auto func_addr = jit->get()->lookup(a.first);
+      auto func_addr2 = jit->get()->lookup(a.second);
+      if (func_addr && func_addr2)
+      {
+        u64 addr1 = func_addr->getValue();
+        u64 addr2 = func_addr2->getValue();
+
+        printf("addr1 0x%016llx\n", addr1);
+        printf("addr2 0x%016llx\n", addr2);
+
+        printf("[addr1] 0x%016llx\n", *(u64 *)addr1);
+        printf("[addr2] 0x%016llx\n", *(u64 *)addr2);
+
+        u8 *code = (u8 *)addr1;
+
+        u64 map_addr = addr1 & ~(4096 -1);
+
+        u8 *code2 = (u8 *)mmap((void *)(map_addr), 4096, PROT_WRITE | PROT_READ | PROT_EXEC, MAP_FIXED | MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+
+        printf("ptr %p (%p) %p\n", code, (void *)map_addr, code2);
+#if 1
+        u8 *code3 = &code2[addr1 - map_addr];
+        code3[0] = 0xe9;
+        i32 diff = addr2 - addr1 - 5 /* jmp instruction length */;
+        memcpy(&code3[1], &diff, 4);
+#endif
+
+      }
+      else
+      {
+        printf("Failed to get function addresses\n");
+      }
+    }
+    cenv.patches.clear();
+
     auto func_addr = jit->get()->lookup(cenv.toplevel_function_name);
     if (func_addr)
     {
-      i64 (*fun)() = func_addr->toPtr<i64()>();
+      //i64 (*fun)() = func_addr->toPtr<i64()>();
+      i64 (*fun)() = (i64 (*)())func_addr->getValue();
       i64 code_result = fun();
       printf("Result = %ld\n", code_result);
     }

@@ -17,5 +17,5 @@ Type
 ## Example
 Run `./lang` and type:
 ```
-  def a(x) { 10 * x; }; a(a(10 + 20) - 1);
+  a(x) = { 10 * x; }; a(a(10 + 20) - 1);
 ```
