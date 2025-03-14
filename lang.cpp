@@ -1,28 +1,3 @@
-/* building IR */
-#include "llvm/ADT/APFloat.h"
-// #include "llvm/ADT/STLExtras.h"
-#include "llvm/IR/BasicBlock.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Type.h"
-#include "llvm/IR/Verifier.h"
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/StandardInstrumentations.h"
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/Target/TargetMachine.h"
-#include "llvm/Transforms/InstCombine/InstCombine.h"
-#include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Scalar/GVN.h"
-#include "llvm/Transforms/Scalar/Reassociate.h"
-#include "llvm/Transforms/Scalar/SimplifyCFG.h"
-/* JIT */
-#include "llvm/Support/InitLLVM.h"
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
-
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -39,6 +14,10 @@ typedef int i32;
 typedef unsigned int u32;
 typedef long int i64;
 typedef unsigned long int u64;
+
+///////////////////////////////////////////////////////////////////////////////
+// 1 PARSER
+///////////////////////////////////////////////////////////////////////////////
 
 enum
 {
@@ -64,12 +43,15 @@ enum
   TOK_COMMA,
   TOK_COLON,
   TOK_SEMICOLON,
+
+  TOK_DECLARE,
+  TOK_ERROR,
 };
 
 typedef struct Token_
 {
   int type;
-  char string[64];
+  char string[128];
   u64 integer;
   double floatval;
 
@@ -125,6 +107,12 @@ void CopyChar(TokenizerState *state)
   state->buffer[state->buffer_pos++] = *state->it++;
 }
 
+void CopyCharAs(TokenizerState *state, char c)
+{
+  state->buffer[state->buffer_pos++] = c;
+  state->it++;
+}
+
 bool IsIdentifierChar(char c)
 {
   if ((c >= '0' && c <= '9')
@@ -161,6 +149,7 @@ struct
   int type;
 } specializations[] =
 {
+  { "declare", TOK_DECLARE },
 };
 
 bool SpecalizeIdentifier(Token *t)
@@ -248,6 +237,55 @@ rescan:
         SpecalizeIdentifier(&t);
         return t;
       case STATE_STRING:
+        state->it++;
+        while (state->it != state->end)
+        {
+          char c = *state->it;
+
+          if (c == '\"')
+          {
+            state->it++;
+            break;
+          }
+          else if (c == '\\')
+          {
+            state->it++;
+            if (state->it == state->end)
+            {
+              t.type = TOK_ERROR;
+              strcpy(t.string, "Error while parsing string\n");
+              t.pos = (int)(state->it - 1 - state->begin);
+              return t;
+            }
+
+            switch (*state->it)
+            {
+              case '"':
+              case '\\':
+                CopyChar(state);
+                break;
+              case 'n':
+                CopyCharAs(state, '\n');
+                break;
+              case 'r':
+                CopyCharAs(state, '\r');
+                break;
+              case 't':
+                CopyCharAs(state, '\t');
+                break;
+              case 'x':
+                break;
+            }
+          }
+          else
+          {
+            CopyChar(state);
+          }
+        }
+        state->buffer[state->buffer_pos] = '\0';
+        t.type = TOK_STRING;
+        strcpy(t.string, state->buffer);
+        return t;
         break;
       case STATE_INTEGER:
         while (state->it != state->end && IsNumeric(*state->it))
@@ -261,7 +299,7 @@ rescan:
         }
         state->buffer[state->buffer_pos] = '\0';
         t.type = TOK_INTEGER;
-        t.integer = atoi(state->buffer);
+        t.integer = strtoul(state->buffer, NULL, 10);
         return t;
       case STATE_FLOAT:
         while (state->it != state->end && IsNumericFloat(*state->it))
@@ -307,9 +345,26 @@ enum {
   NODE_DIVIDE,
   NODE_NEGATE,
 
+  NODE_DECLARE,
   NODE_FUNCTION_DEFINITION,
   NODE_ASSIGN,
 };
+
+typedef enum {
+  TYPE_NONE = 0,
+  TYPE_I64,
+  TYPE_U64,
+  TYPE_F64,
+  TYPE_F32,
+  TYPE_U8,
+  TYPE_I8,
+  TYPE_U16,
+  TYPE_I16,
+  TYPE_U32,
+  TYPE_I32,
+  TYPE_PTR,
+  TYPE_VOID,
+} ETypes;
 
 typedef struct AstNode {
   int type;
@@ -317,6 +372,7 @@ typedef struct AstNode {
   struct AstNode *args;
   struct AstNode *args2; /* second part of data - function body etc. */
 
+  int return_type;
   /* function data */
   Token function_name;
 
@@ -348,7 +404,7 @@ AstNode *AddAstNode(AstNode **first, AstNode **last, AstNode *node)
   return node;
 }
 
-void IntepreterError(TokenizerState *state, int pos, const char *fmt, ...)
+void CodeError(const char *code_begin, const char *code_end, int pos, const char *fmt, ...)
 {
   char tmp[1024];
   va_list list;
@@ -357,11 +413,11 @@ void IntepreterError(TokenizerState *state, int pos, const char *fmt, ...)
   va_end(list);
 
   int line = 1;
-  const char *line_start = state->begin;
+  const char *line_start = code_begin;
 
-  const char *it = state->begin;
+  const char *it = code_begin;
 
-  while (it != state->end && (it - state->begin) < pos)
+  while (it != code_end && (it - code_begin) < pos)
   {
     if (*it == '\n')
     {
@@ -374,7 +430,7 @@ void IntepreterError(TokenizerState *state, int pos, const char *fmt, ...)
   int column = (int)(it - line_start);
 
   const char *line_end = line_start;
-  while (it != state->end)
+  while (it != code_end)
   {
     if ((*it == '\n') || (*it == '\r'))
     {
@@ -442,7 +498,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (!expr)
           {
-            IntepreterError(state, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
             return NULL;
           }
 
@@ -459,7 +515,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
             {
               if (node->type != NODE_IDENTIFIER)
               {
-                IntepreterError(state, node->token.pos, "In function definition argument must be a variable\n");
+                CodeError(state->begin, state->end, node->token.pos, "In function definition argument must be a variable\n");
                 return NULL;
               }
             }
@@ -491,7 +547,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
 
           if (!node1)
           {
-            IntepreterError(state, t1.pos, "Missing argument\n");
+            CodeError(state->begin, state->end, t1.pos, "Missing argument\n");
             return NULL;
           }
           expr = MakeAstNode(NODE_NEGATE, t1);
@@ -504,7 +560,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (!expr)
           {
-            IntepreterError(state, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
             return NULL;
           }
           AstNode *node1 = expr;
@@ -512,7 +568,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
 
           if (!node2)
           {
-            IntepreterError(state, t1.pos, "Failed to parse second operand\n");
+            CodeError(state->begin, state->end, t1.pos, "Failed to parse second operand\n");
             return NULL;
           }
           expr = MakeAstNode(t1.type == TOK_PLUS ? NODE_ADD :
@@ -526,7 +582,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         expr = ParseExpression(state, TOK_RIGHT_PAREN, -1, 0);
         if (!expr)
         {
-          IntepreterError(state, t1.pos, "Empty parenthesis\n");
+          CodeError(state->begin, state->end, t1.pos, "Empty parenthesis\n");
           return NULL;
         }
         else
@@ -539,7 +595,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (expr)
           {
-            IntepreterError(state, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
             return NULL;
           }
 
@@ -550,7 +606,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (expr)
           {
-            IntepreterError(state, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
             return NULL;
           }
 
@@ -558,6 +614,37 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         }
         break;
       case TOK_STRING:
+        {
+          if (expr)
+          {
+            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+            return NULL;
+          }
+
+          expr = MakeAstNode(NODE_STRING, t1);
+        }
+        break;
+      case TOK_DECLARE:
+        {
+          if (expr)
+          {
+            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+            return NULL;
+          }
+
+          Token t2 = PeekToken(state);
+          if (t2.type == TOK_LEFT_PAREN)
+          {
+            PopToken(state);
+            expr = MakeAstNode(NODE_DECLARE, t1);
+
+            ParseList(&expr->args, state, TOK_COMMA, TOK_RIGHT_PAREN);
+          }
+          else
+          {
+            return NULL;
+          }
+        }
         break;
       case TOK_IDENTIFIER:
         {
@@ -573,7 +660,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
           {
             if (expr)
             {
-              IntepreterError(state, t1.pos, "Unexpected token\n");
+              CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
               return NULL;
             }
 
@@ -582,7 +669,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         }
         break;
       default:
-        IntepreterError(state, t1.pos, "Unexpected token\n");
+        CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
         return NULL;
         break;
     }
@@ -610,7 +697,7 @@ void ParseList(AstNode **node, TokenizerState *state, int separator, int end_tok
     }
     else if (t1.type == TOK_EOF)
     {
-      IntepreterError(state, t1.pos, "Missing token\n");
+      CodeError(state->begin, state->end, t1.pos, "Missing token\n");
       return;
     }
     else
@@ -643,7 +730,7 @@ void ParseBody(AstNode **node, TokenizerState *state)
     }
     else if (t1.type == TOK_EOF)
     {
-      IntepreterError(state, t1.pos, "Missing token\n");
+      CodeError(state->begin, state->end, t1.pos, "Missing token\n");
       return;
     }
     else
@@ -679,7 +766,7 @@ AstNode *ParseToplevel(TokenizerState *state)
   return first;
 }
 
-const char *StringType(int type)
+const char *NodeToString(int type)
 {
   switch (type)
   {
@@ -693,6 +780,7 @@ const char *StringType(int type)
     case NODE_DIVIDE: return "DIVIDE";
     case NODE_NEGATE: return "NEGATE";
     case NODE_IDENTIFIER: return "IDENTIFIER";
+    case NODE_DECLARE: return "DECLARE";
     case NODE_FUNCTION_DEFINITION: return "FUNCTION_DEFINITION";
     case NODE_ASSIGN: return "ASSIGN";
   }
@@ -705,7 +793,7 @@ void PrintAstNode1(AstNode *node, int level)
   {
     for (int i = 0; i < level; i++)
       printf("  ");
-    printf("Node: %d (%s)", node->type, StringType(node->type));
+    printf("Node: %d (%s)", node->type, NodeToString(node->type));
     switch (node->type)
     {
       case NODE_INTEGER:
@@ -713,6 +801,14 @@ void PrintAstNode1(AstNode *node, int level)
         break;
       case NODE_FLOAT:
         printf(" value %f\n", node->token.floatval);
+        break;
+      case NODE_STRING:
+        printf(" value \"%s\"\n", node->token.string);
+        break;
+      case NODE_FUNCALL:
+        printf(" %s\n", node->token.string);
+        if (node->args)
+          PrintAstNode1(node->args, level + 1);
         break;
       case NODE_IDENTIFIER:
         printf(" value %s\n", node->token.string);
@@ -724,6 +820,11 @@ void PrintAstNode1(AstNode *node, int level)
         printf(" value:\n");
         if (node->args2)
           PrintAstNode1(node->args2, level + 1);
+        break;
+      case NODE_DECLARE:
+        printf(" declaration name \"%s\" args:\n", node->function_name.string);
+        if (node->args)
+          PrintAstNode1(node->args, level + 1);
         break;
       case NODE_FUNCTION_DEFINITION:
         printf(" function name \"%s\" args:\n", node->function_name.string);
@@ -748,7 +849,11 @@ void PrintAstNode1(AstNode *node, int level)
 
 void PrintAstNode(AstNode *node)
 {
-  PrintAstNode1(node, 0);
+  printf("AstNode %p:\n", node);
+  if (node)
+  {
+    PrintAstNode1(node, 1);
+  }
 }
 
 void FreeAstNode(AstNode *node)
@@ -769,50 +874,62 @@ void FreeAstNode(AstNode *node)
   }
 }
 
-using namespace llvm;
-using namespace llvm::orc;
+///////////////////////////////////////////////////////////////////////////////
+// 2 COMPILER
+///////////////////////////////////////////////////////////////////////////////
 
-std::unique_ptr<FunctionPassManager> TheFPM;
-std::unique_ptr<LoopAnalysisManager> TheLAM;
-std::unique_ptr<FunctionAnalysisManager> TheFAM;
-std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
-std::unique_ptr<ModuleAnalysisManager> TheMAM;
-std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
-std::unique_ptr<StandardInstrumentations> TheSI;
+/* building IR */
+#include "llvm/ADT/APFloat.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/DynamicLibrary.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+/* JIT */
+#include "llvm/Support/InitLLVM.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
 
-typedef enum {
-  TYPE_NONE = 0,
-  TYPE_I64,
-  TYPE_U64,
-  TYPE_F64,
-} ETypes;
+typedef struct {
+  int type;
+  const char *name;
+  const char *name_lowercase;
+  int bits;
+  bool floating_point;
+  bool sign;
+  int alt_type;
+} TypeDescription;
 
-typedef struct FunctionDeclaration {
-  char name[128];
-  ETypes return_type;
-  std::vector<ETypes> arg_types;
-  int iteration;
-} FunctionDeclaration;
+TypeDescription type_descriptions[] = {
+  { TYPE_NONE, "NONE", "none", 0, false, false, TYPE_NONE},
+  { TYPE_VOID, "VOID", "void", 0, false, false, TYPE_VOID},
+  { TYPE_I64, "I64", "i64", 64, false, true, TYPE_U64},
+  { TYPE_U64, "U64", "u64", 64, false, false, TYPE_I64},
+  { TYPE_F64, "F64", "f64", 64, true, true, TYPE_F64},
+  { TYPE_F32, "F32", "f32", 32, true, true, TYPE_F64},
+  { TYPE_U8, "U8", "u8", 8, false, false, TYPE_I8},
+  { TYPE_I8, "I8", "i8", 8, false, true, TYPE_U8},
+  { TYPE_U16, "U16", "u16", 16, false, false, TYPE_I16},
+  { TYPE_I16, "I16", "i16", 16, false, true, TYPE_U16},
+  { TYPE_U32, "U32", "u32", 32, false, false, TYPE_I32},
+  { TYPE_I32, "I32", "i32", 32, false, true, TYPE_U32},
+  { TYPE_PTR, "PTR", "ptr", 64, false, false, TYPE_PTR},
+};
 
-Type *LlvmType(ETypes type, LLVMContext *context)
-{
-  switch (type)
-  {
-    case TYPE_NONE:
-      return NULL;
-      break;
-    case TYPE_I64:
-    case TYPE_U64:
-    default:
-      return Type::getInt64Ty(*context);
-      break;
-    case TYPE_F64:
-      return Type::getDoubleTy(*context);
-      break;
-  }
-}
-
-const char *TypeToString(ETypes type)
+const char *TypeToString(int type)
 {
   switch (type)
   {
@@ -820,8 +937,182 @@ const char *TypeToString(ETypes type)
     case TYPE_I64: return "I64";
     case TYPE_U64: return "U64";
     case TYPE_F64: return "F64";
+    case TYPE_F32: return "F32";
+    case TYPE_U8: return "U8";
+    case TYPE_I8: return "I8";
+    case TYPE_U16: return "U16";
+    case TYPE_I16: return "I16";
+    case TYPE_U32: return "U32";
+    case TYPE_I32: return "I32";
+    case TYPE_VOID: return "VOID";
     default: return "UNKNOWN";
   }
+}
+
+int FindType(int bits, bool sign, bool floating_point)
+{
+  for (int i = 0; i < sizeof(type_descriptions) / sizeof(type_descriptions[0]); i++)
+  {
+    if ((type_descriptions[i].bits == bits) &&
+        (type_descriptions[i].sign == sign) &&
+        (type_descriptions[i].floating_point == floating_point))
+      return type_descriptions[i].type;
+  }
+
+  return TYPE_NONE;
+}
+
+TypeDescription *FindTypeDescription(int type)
+{
+  for (int i = 0; i < sizeof(type_descriptions) / sizeof(type_descriptions[0]); i++)
+  {
+    //if (strcmp(type_descriptions[i].name, arg->token.string) == 0)
+    if (type_descriptions[i].type == type)
+      return &type_descriptions[i];
+  }
+
+  return NULL;
+}
+
+int UprateTypes(int typea, int typeb)
+{
+  TypeDescription *t1 = FindTypeDescription(typea);
+  TypeDescription *t2 = FindTypeDescription(typeb);
+
+  int max_bits_type = t1->bits;
+  if (t2->bits > t1->bits)
+    max_bits_type = t2->bits;
+
+  int ret = FindType(max_bits_type, t1->sign || t2->sign, t1->floating_point || t2->floating_point);
+
+  printf("Uprate %s, %s -> %s\n", TypeToString(typea), TypeToString(typeb), TypeToString(ret));
+  return ret;
+}
+
+typedef struct VariableDefinition {
+  char name[128];
+  int type;
+  llvm::Value *value;
+} VariableDefinition;
+
+typedef struct Scope {
+  std::vector<VariableDefinition> variables;
+} Scope;
+
+typedef struct FunctionDeclaration {
+  char name[128];
+  int return_type;
+  std::vector<int> arg_types;
+  int iteration;
+  int num_arguments;
+} FunctionDeclaration;
+
+typedef struct GlobalVariableDef {
+  char name[128];
+  int type;
+  bool constant;
+} GlobalVariableDef;
+
+typedef struct CompileEnvironment {
+  std::unique_ptr<llvm::LLVMContext> context;
+  llvm::IRBuilder<> *builder;
+  std::unique_ptr<llvm::Module> mod;
+
+  char module_name[64];
+  char toplevel_function_name[64];
+
+  std::vector<FunctionDeclaration> function_declarations;
+  std::vector<GlobalVariableDef> global_variables;
+
+  std::vector<std::pair<char *, char *>> patches;
+
+  // source code (for printing errors)
+  const char *code_begin;
+  const char *code_end;
+} CompileEnvironment;
+
+VariableDefinition *FindVariable(Scope *scope, const char *name)
+{
+  if (!scope)
+  {
+    return NULL;
+  }
+
+  for (int i = scope->variables.size() - 1; i >= 0; i--)
+  {
+    if (strcmp(scope->variables[i].name, name) == 0)
+    {
+      return &scope->variables[i];
+    }
+  }
+
+  return NULL;
+}
+
+#if 0
+std::unique_ptr<FunctionPassManager> TheFPM;
+std::unique_ptr<LoopAnalysisManager> TheLAM;
+std::unique_ptr<FunctionAnalysisManager> TheFAM;
+std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
+std::unique_ptr<ModuleAnalysisManager> TheMAM;
+std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
+std::unique_ptr<StandardInstrumentations> TheSI;
+#endif
+
+llvm::Type *LlvmType(int type, llvm::LLVMContext *context)
+{
+  switch (type)
+  {
+    case TYPE_NONE:
+      return NULL;
+      break;
+    case TYPE_VOID:
+      return llvm::Type::getVoidTy(*context);
+      break;
+    case TYPE_I64:
+    case TYPE_U64:
+    default:
+      return llvm::Type::getInt64Ty(*context);
+      break;
+    case TYPE_F64:
+      return llvm::Type::getDoubleTy(*context);
+      break;
+    case TYPE_F32:
+      return llvm::Type::getFloatTy(*context);
+      break;
+    case TYPE_I32:
+    case TYPE_U32:
+      return llvm::Type::getInt32Ty(*context);
+      break;
+    case TYPE_I16:
+    case TYPE_U16:
+      return llvm::Type::getInt16Ty(*context);
+      break;
+    case TYPE_I8:
+    case TYPE_U8:
+      return llvm::Type::getInt8Ty(*context);
+      break;
+  }
+}
+
+int LlvmToType(llvm::Type *type)
+{
+  if (type->isVoidTy())
+    return TYPE_VOID;
+  if (type->isDoubleTy())
+    return TYPE_F64;
+  if (type->isFloatTy())
+    return TYPE_F32;
+  if (type->isIntegerTy(64))
+    return TYPE_U64;
+  if (type->isIntegerTy(32))
+    return TYPE_U32;
+  if (type->isIntegerTy(16))
+    return TYPE_U16;
+  if (type->isIntegerTy(8))
+    return TYPE_U8;
+
+  return TYPE_NONE;
 }
 
 void PrintFunctionDeclaration(FunctionDeclaration *fun_decl)
@@ -834,204 +1125,530 @@ void PrintFunctionDeclaration(FunctionDeclaration *fun_decl)
   printf(")\n");
 }
 
-Function *AddFunctionDeclaration(FunctionDeclaration *fun_decl, LLVMContext *context, Module *mod)
+llvm::Function *AddFunctionDeclaration(FunctionDeclaration *fun_decl, llvm::LLVMContext *context, llvm::Module *mod)
 {
   printf("Adding function declaration: ");
   PrintFunctionDeclaration(fun_decl);
 
-  std::vector<Type *> types;
+  std::vector<llvm::Type *> types;
   for (auto &a : fun_decl->arg_types)
   {
     types.push_back(LlvmType(a, context));
   }
-  FunctionType *ft = FunctionType::get(LlvmType(fun_decl->return_type, context), types, false);
+  llvm::FunctionType *ft = llvm::FunctionType::get(LlvmType(fun_decl->return_type, context), types, false);
   //Function *f = mod->getFunction(node->function_name.string);
-  Function *f = Function::Create(ft, Function::ExternalLinkage, fun_decl->name, *mod);
+  llvm::Function *f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fun_decl->name, *mod);
 
   return f;
 }
 
-typedef struct CompileEnvironment {
-  std::unique_ptr<LLVMContext> context;
-  IRBuilder<> *builder;
-  std::unique_ptr<Module> mod;
-
-  char module_name[64];
-  char toplevel_function_name[64];
-
-  std::vector<FunctionDeclaration> function_declarations;
-
-  std::vector<std::pair<char *, char *>> patches;
-} CompileEnvironment;
-
-typedef struct Scope {
-  std::vector<Value *> values;
-  std::vector<char *> names;
-} Scope;
-
-Value *FindVar(Scope *scope, const char *name)
+llvm::GlobalVariable *FindGlobalVariable(CompileEnvironment *cenv, const char *name, int type)
 {
-  if (!scope)
-  {
-    return NULL;
-  }
+  llvm::GlobalVariable *var = cenv->mod->getGlobalVariable(name);
 
-  for (int i = scope->names.size() - 1; i >= 0; i--)
+  if (var)
+    return var;
+
+  for (auto &a : cenv->global_variables)
   {
-    if (strcmp(scope->names[i], name) == 0)
+    if (strcmp(a.name, name) == 0)
     {
-      return scope->values[i];
+      printf("Found global variable %s\n", name);
+      if ((type != -1) && (type != a.type))
+      {
+        printf("Type mismatch %s %s\n", TypeToString(type), TypeToString(a.type));
+      }
+
+      auto llvm_type = LlvmType(a.type, cenv->context.get());
+      var = new llvm::GlobalVariable(*cenv->mod, llvm_type, false,
+          llvm::GlobalValue::ExternalLinkage, nullptr, name);
+      break;
     }
   }
 
-  return NULL;
+  return var;
 }
 
-Value *GenerateIr(AstNode *node, Scope *scope, bool toplevel, CompileEnvironment *cenv);
+struct {
+  const char *name;
+  int type;
+} specialization_type[] = {
+  { "i64", TYPE_I64},
+  { "u64", TYPE_U64},
+  { "f64", TYPE_F64},
+  { "f32", TYPE_F32},
+  { "u8", TYPE_U8},
+  { "i8", TYPE_I8},
+  { "u16", TYPE_U16},
+  { "i16", TYPE_I16},
+  { "u32", TYPE_U32},
+  { "i32", TYPE_I32},
+};
 
-Value *GenerateIrList(AstNode *node, Scope *scope, bool toplevel, CompileEnvironment *cenv)
+int IdentifierToType(AstNode *arg)
 {
-  Value *ret_val = NULL;
+  if (arg->type == NODE_IDENTIFIER)
+  {
+    for (int i = 0; i < sizeof(specialization_type) / sizeof(specialization_type[0]); i++)
+    {
+      if (strcmp(specialization_type[i].name, arg->token.string) == 0)
+        return specialization_type[i].type;
+    }
+  }
+  return TYPE_NONE;
+}
+
+int FindByName(const void *data, int element_size, int count, int offset, const char *str)
+{
+  const char *data8 = (const char *)data;
+  for (int i = 0; i < count; i++)
+  {
+    if (strcmp(data8 + i * element_size + offset, str) == 0)
+      return i;
+  }
+
+  return -1;
+}
+
+// COMPILE PASSES
+
+int CollectDeclarations(AstNode *node, Scope *scope, CompileEnvironment *cenv, bool all)
+{
+  int return_value = 0;
   while (node)
   {
-    ret_val = GenerateIr(node, scope, toplevel, cenv);
+    switch (node->type)
+    {
+      case NODE_INTEGER:
+      case NODE_FLOAT:
+      case NODE_STRING:
+      case NODE_ADD:
+      case NODE_MULTIPLY:
+      case NODE_SUBTRACT:
+      case NODE_DIVIDE:
+      case NODE_IDENTIFIER:
+      case NODE_FUNCALL:
+        /* nothing to do */
+        break;
+      case NODE_ASSIGN:
+        {
+          const char *name = node->args->token.string;
+
+          if (!scope)
+          {
+            int idx = FindByName(&cenv->global_variables[0], sizeof(GlobalVariableDef),
+                cenv->global_variables.size(), offsetof(GlobalVariableDef, name), name);
+
+            if (idx < 0)
+            {
+              /* new global variable */
+              printf("Adding global variable: %s\n", name);
+              GlobalVariableDef global_var;
+              strcpy(global_var.name, name);
+              global_var.constant = false;
+              cenv->global_variables.push_back(global_var);
+            }
+          }
+        }
+        break;
+      case NODE_DECLARE:
+        {
+          AstNode *arg = node->args;
+          FunctionDeclaration fun_decl;
+          fun_decl.iteration = 0;
+          fun_decl.num_arguments = 0;
+          fun_decl.return_type = IdentifierToType(arg);
+          arg = arg->next;
+          strcpy(fun_decl.name, arg->token.string);
+          arg = arg->next;
+
+          for (; arg; arg = arg->next)
+          {
+            fun_decl.arg_types.push_back(IdentifierToType(arg));
+            fun_decl.num_arguments++;
+          }
+
+          printf("Adding function declaration: %s\n", fun_decl.name);
+          cenv->function_declarations.push_back(fun_decl);
+        }
+        break;
+      case NODE_FUNCTION_DEFINITION:
+        {
+          bool found = false;
+          for (auto &a : cenv->function_declarations)
+          {
+            if (strcmp(a.name, node->function_name.string) == 0)
+            {
+              found = true;
+              break;
+            }
+          }
+
+          if (!found)
+          {
+            FunctionDeclaration fun_decl;
+            fun_decl.iteration = 0;
+            fun_decl.num_arguments = 0;
+            strcpy(fun_decl.name, node->function_name.string);
+
+            printf("Adding function definition: %s\n", fun_decl.name);
+
+            for (AstNode *arg = node->args; arg; arg = arg->next)
+              fun_decl.num_arguments++;
+
+            cenv->function_declarations.push_back(fun_decl);
+          }
+        }
+        break;
+      default:
+        printf("%s: Unsupported node %s\n", __func__, NodeToString(node->type));
+        break;
+    }
+
+    if (!all)
+      return return_value;
+
+    if (!node->next)
+      return return_value;
+
+    node = node->next;
+  }
+  return return_value;
+}
+
+int InferTypes(AstNode *node, Scope *scope, CompileEnvironment *cenv, bool all)
+{
+  while (node)
+  {
+    switch (node->type)
+    {
+      case NODE_INTEGER:
+        node->return_type = TYPE_I64;
+        break;
+      case NODE_FLOAT:
+        node->return_type = TYPE_F64;
+        break;
+      case NODE_STRING:
+        node->return_type = TYPE_U64;
+        break;
+      case NODE_IDENTIFIER:
+        {
+          const char *name = node->token.string;
+
+          VariableDefinition *lexical_var = FindVariable(scope, name);
+          if (lexical_var)
+            node->return_type = lexical_var->type;
+        }
+        break;
+      case NODE_SUBTRACT:
+        if (!node->args->next)
+        {
+          node->return_type = InferTypes(node->args, scope, cenv, false);
+          break;
+        }
+      case NODE_ADD:
+      case NODE_MULTIPLY:
+      case NODE_DIVIDE:
+        {
+          int a = InferTypes(node->args, scope, cenv, false);
+          int b = InferTypes(node->args->next, scope, cenv, false);
+
+          node->return_type = UprateTypes(a, b);
+        }
+        break;
+      case NODE_FUNCALL:
+        {
+          InferTypes(node->args, scope, cenv, true);
+
+          /* TODO return type of the function */
+          node->return_type = TYPE_I64;
+        }
+        break;
+      case NODE_ASSIGN:
+        node->return_type = InferTypes(node->args2, scope, cenv, false);
+        break;
+      case NODE_DECLARE:
+        node->return_type = TYPE_VOID;
+        break;
+      case NODE_FUNCTION_DEFINITION:
+        node->return_type = TYPE_VOID;
+        break;
+      default:
+        break;
+    }
+
+    if (!all)
+      return node->return_type;
+
+    if (!node->next)
+      return node->return_type;
+
     node = node->next;
   }
 
-  return ret_val;
+  return TYPE_NONE;
 }
 
-Value *GenerateIr(AstNode *node, Scope *scope, bool toplevel, CompileEnvironment *cenv)
-{
-  switch (node->type)
-  {
-    case NODE_INTEGER:
-      return ConstantInt::get(Type::getInt64Ty(*cenv->context), node->token.integer, false);
-      break;
-    case NODE_FLOAT:
-      return ConstantFP::get(*cenv->context, APFloat(node->token.floatval));
-      break;
-    case NODE_ADD:
-    case NODE_MULTIPLY:
-    case NODE_SUBTRACT:
-    case NODE_DIVIDE:
-      {
-        Value *a = GenerateIr(node->args, scope, toplevel, cenv);
-        Value *b = GenerateIr(node->args->next, scope, toplevel, cenv);
-        if (node->type == NODE_ADD)
-          return cenv->builder->CreateAdd(a, b);
-        else if (node->type == NODE_MULTIPLY)
-          return cenv->builder->CreateMul(a, b);
-        else if (node->type == NODE_SUBTRACT)
-          return cenv->builder->CreateSub(a, b);
-        else if (node->type == NODE_DIVIDE)
-          return cenv->builder->CreateSDiv(a, b);
-      }
-      break;
-    case NODE_IDENTIFIER:
-      {
-        return FindVar(scope, node->token.string);
-      }
-      break;
-    case NODE_FUNCALL:
-      {
-        Function *f = cenv->mod->getFunction(node->token.string);
-        if (f)
-        {
-          std::vector<Value *> args;
-          AstNode *n = node->args;
-          while (n)
-          {
-            args.push_back(GenerateIr(n, scope, toplevel, cenv));
-            n = n->next;
-          }
 
-          //cenv->builder->CreateCall(f->getFunctionType(), NULL, args);
-          return cenv->builder->CreateCall(f, args);
-        }
-        else
+llvm::Value *GenerateIr(AstNode *node, Scope *scope, CompileEnvironment *cenv, bool all)
+{
+  llvm::Value *return_value = nullptr;
+  while (node)
+  {
+    switch (node->type)
+    {
+      case NODE_INTEGER:
+        return_value = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*cenv->context), node->token.integer, false);
+        break;
+      case NODE_FLOAT:
+        return_value = llvm::ConstantFP::get(*cenv->context, llvm::APFloat(node->token.floatval));
+        break;
+      case NODE_STRING:
+        return_value = cenv->builder->CreateGlobalString(node->token.string);
+        break;
+      case NODE_ADD:
+      case NODE_MULTIPLY:
+      case NODE_SUBTRACT:
+      case NODE_DIVIDE:
         {
-          printf("Error: no function for name \"%s\" found, can't emit function call\n", node->token.string);
-          return NULL;
+          llvm::Value *a = GenerateIr(node->args, scope, cenv, false);
+          llvm::Value *b = GenerateIr(node->args->next, scope, cenv, false);
+          if (node->type == NODE_ADD)
+            return_value = cenv->builder->CreateAdd(a, b);
+          else if (node->type == NODE_MULTIPLY)
+            return_value = cenv->builder->CreateMul(a, b);
+          else if (node->type == NODE_SUBTRACT)
+            return_value = cenv->builder->CreateSub(a, b);
+          else if (node->type == NODE_DIVIDE)
+            return_value = cenv->builder->CreateSDiv(a, b);
+          // return_value = cenv->builder->CreateFDiv(a, b); TODO
         }
-      }
-      break;
-    case NODE_FUNCTION_DEFINITION:
-      {
-        FunctionDeclaration fun_decl;
-        fun_decl.iteration = 0;
-        strcpy(fun_decl.name, node->function_name.string);
-        for (auto &a : cenv->function_declarations)
+        break;
+      case NODE_IDENTIFIER:
         {
-          if (strcmp(a.name, node->function_name.string) == 0)
+          const char *name = node->token.string;
+
+          VariableDefinition *lexical_var = FindVariable(scope, name);
+          if (lexical_var)
           {
-            snprintf(fun_decl.name, sizeof(fun_decl.name), "%s_%d", node->function_name.string, a.iteration++);
-            cenv->patches.push_back(std::make_pair(strdup(a.name), strdup(fun_decl.name)));
+            return_value = lexical_var->value;
             break;
           }
+
+
+          llvm::GlobalVariable *var = FindGlobalVariable(cenv, name, -1);
+          if (var)
+          {
+            return_value = cenv->builder->CreateLoad(var->getValueType(), var, false /* volatile */);
+            break;
+          }
+
+          CodeError(cenv->code_begin, cenv->code_end, node->token.pos, "Error - Variable \"%s\" not found\n", name);
+          return NULL;
         }
-        fun_decl.return_type = TYPE_I64;
-
-        for (AstNode *arg = node->args; arg; arg = arg->next)
-        {
-          //types.push_back(Type::getInt64Ty(*cenv->context));
-          fun_decl.arg_types.push_back(TYPE_I64);
-        }
-        //FunctionType *ft = FunctionType::get(Type::getInt64Ty(*cenv->context) /*return*/, types, false);
-        //Function *f = cenv->mod->getFunction(node->function_name.string);
-
-        Function *f = AddFunctionDeclaration(&fun_decl, cenv->context.get(), cenv->mod.get());
-        BasicBlock *block = BasicBlock::Create(*cenv->context, "body", f);
-        auto previous_insert = cenv->builder->saveIP();
-        cenv->builder->SetInsertPoint(block);
-        cenv->function_declarations.push_back(fun_decl);
-
-        Scope s;
+        break;
+      case NODE_DECLARE:
         {
           AstNode *arg = node->args;
-          for (auto &a : f->args())
+          FunctionDeclaration fun_decl;
+          fun_decl.iteration = 0;
+          fun_decl.return_type = IdentifierToType(arg);
+          arg = arg->next;
+          strcpy(fun_decl.name, arg->token.string);
+          arg = arg->next;
+
+          for (; arg; arg = arg->next)
           {
-            /* get Value types for arguments */
-            a.setName(arg->token.string);
+            fun_decl.arg_types.push_back(IdentifierToType(arg));
+          }
 
-            s.values.push_back(&a);
-            s.names.push_back(arg->token.string);
+          cenv->function_declarations.push_back(fun_decl);
 
-            arg = arg->next;
+          /*Function *f =*/ AddFunctionDeclaration(&fun_decl, cenv->context.get(), cenv->mod.get());
+        }
+        break;
+      case NODE_FUNCALL:
+        {
+          std::vector<llvm::Value *> args;
+          for (AstNode *arg = node->args; arg; arg = arg->next)
+          {
+            args.push_back(GenerateIr(arg, scope, cenv, false));
+          }
+
+          llvm::Function *f = cenv->mod->getFunction(node->token.string);
+          if (!f)
+          {
+#if 1
+            FunctionDeclaration fun_decl;
+            strcpy(fun_decl.name, node->token.string);
+            fun_decl.return_type = TYPE_I64;
+            for (AstNode *arg = node->args; arg; arg = arg->next)
+            {
+              fun_decl.arg_types.push_back(arg->return_type);
+            }
+
+            f = AddFunctionDeclaration(&fun_decl, cenv->context.get(), cenv->mod.get());
+#else
+            std::vector<Type *> types;
+            for (auto &a : args)
+            {
+              types.push_back(a->getType());
+            }
+
+            FunctionType *ft = FunctionType::get(LlvmType(TYPE_I64, cenv->context.get()), types, false);
+            f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, node->token.string, *cenv->mod);
+#endif
+          }
+          if (f)
+          {
+            return_value = cenv->builder->CreateCall(f, args);
+          }
+          else
+          {
+            printf("Error: no function for name \"%s\" found, can't emit function call\n", node->token.string);
+            return NULL;
           }
         }
-
-        /* generate IR for the function body */
-        Value *ret_val = GenerateIrList(node->args2, &s, false, cenv);
-        if (ret_val)
+        break;
+      case NODE_FUNCTION_DEFINITION:
         {
-          cenv->builder->CreateRet(ret_val);
-          verifyFunction(*f);
+          FunctionDeclaration fun_decl;
+          fun_decl.iteration = 0;
+          strcpy(fun_decl.name, node->function_name.string);
+          for (auto &a : cenv->function_declarations)
+          {
+            if (strcmp(a.name, node->function_name.string) == 0)
+            {
+              snprintf(fun_decl.name, sizeof(fun_decl.name), "%s_%d", node->function_name.string, a.iteration++);
+              cenv->patches.push_back(std::make_pair(strdup(a.name), strdup(fun_decl.name)));
+              break;
+            }
+          }
+          fun_decl.return_type = TYPE_I64;
 
-          /* optimize code */
+          for (AstNode *arg = node->args; arg; arg = arg->next)
+          {
+            //types.push_back(llvm::Type::getInt64Ty(*cenv->context));
+            fun_decl.arg_types.push_back(TYPE_I64);
+          }
+          //FunctionType *ft = llvm::FunctionType::get(llvm::Type::getInt64Ty(*cenv->context) /*return*/, types, false);
+          //Function *f = cenv->mod->getFunction(node->function_name.string);
+
+          llvm::Function *f = AddFunctionDeclaration(&fun_decl, cenv->context.get(), cenv->mod.get());
+          llvm::BasicBlock *block = llvm::BasicBlock::Create(*cenv->context, "", f);
+          auto previous_insert = cenv->builder->saveIP();
+          cenv->builder->SetInsertPoint(block);
+          cenv->function_declarations.push_back(fun_decl);
+
+          Scope s;
+          {
+            AstNode *arg = node->args;
+            for (auto &a : f->args())
+            {
+              /* get Value types for arguments */
+              a.setName(arg->token.string);
+
+              VariableDefinition variable_definition;
+              strlcpy(variable_definition.name, arg->token.string, sizeof(variable_definition.name));
+              variable_definition.value = &a;
+              variable_definition.type = arg->return_type;
+
+              s.variables.push_back(variable_definition);
+
+              arg = arg->next;
+            }
+          }
+
+          /* generate IR for the function body */
+          llvm::Value *ret_val = GenerateIr(node->args2, &s, cenv, true);
+          if (ret_val)
+          {
+            cenv->builder->CreateRet(ret_val);
+            llvm::verifyFunction(*f);
+
+            /* optimize code */
 #if 0
-          TheFPM->run(*f, *TheFAM);
+            TheFPM->run(*f, *TheFAM);
 #endif
-        }
-        f->print(errs());
-        cenv->builder->restoreIP(previous_insert);
+          }
+          f->print(llvm::errs());
+          cenv->builder->restoreIP(previous_insert);
 
-      }
-      break;
+        }
+        break;
+      case NODE_ASSIGN:
+        {
+          const char *name = node->args->token.string;
+          int type = node->args2->return_type;
+
+          if (!scope)
+          {
+            llvm::GlobalVariable *var = FindGlobalVariable(cenv, name, type);
+
+            if (!var)
+            {
+              /* add a global variable */
+              printf("Adding global variable: %s, type %s\n", name, TypeToString(type));
+              GlobalVariableDef global_var;
+              strcpy(global_var.name, name);
+              global_var.type = type;
+              global_var.constant = false;
+              cenv->global_variables.push_back(global_var);
+
+              auto llvm_type = LlvmType(type, cenv->context.get());
+              var = new llvm::GlobalVariable(*cenv->mod, llvm_type, global_var.constant,
+                  llvm::GlobalValue::CommonLinkage, llvm::Constant::getNullValue(llvm_type), name);
+            }
+
+            llvm::Value *val = GenerateIr(node->args2, scope, cenv, false);
+            cenv->builder->CreateStore(val, var, false /* volatile */);
+          }
+          else
+          {
+            /* lexical variable */
+          }
+        }
+        break;
+      default:
+        printf("%s: Unsupported node %s\n", __func__, NodeToString(node->type));
+        break;
+    }
+
+    if (!all)
+      return return_value;
+
+    if (!node->next)
+      return return_value;
+
+    node = node->next;
+  }
+  return return_value;
+}
+
+/**
+ * LoadLibrary
+ *
+ * Should be called from the language itself
+ */
+extern "C" int LoadLibrary(const char *library_file)
+{
+  if (llvm::sys::DynamicLibrary::LoadLibraryPermanently(library_file))
+  {
+    printf("failed to load dynamic library: %s\n", library_file);
+    return 1;
   }
 
-  return NULL;
+  return 0;
 }
 
 int main(int argc, char *argv[])
 {
-  InitLLVM raii_1(argc, argv); /* helper class for stacktrace, utf-8 argv etc. */
+  llvm::InitLLVM raii_1(argc, argv); /* helper class for stacktrace, utf-8 argv etc. */
 
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
-  // llvm::InitializeNativeTargetDisassmebler();
 
-  auto jit = LLJITBuilder().create();
+  auto jit = llvm::orc::LLJITBuilder().create();
 
   /* optimization passes */
 #if 0
@@ -1066,32 +1683,75 @@ int main(int argc, char *argv[])
   int inputi = -1;
   CompileEnvironment cenv;
 
+  LoadLibrary("libGL.so");
+  LoadLibrary("libglfw.so.3");
+
+  i8 *file = NULL;
+  if (argc > 1)
+  {
+    const char *filename = argv[1];
+    FILE *f = fopen(filename, "rb");
+    if (!f)
+      printf("Failed to open file \"%s\" for reading.\n", filename);
+
+    fseek(f, 0, SEEK_END);
+    i64 len = ftell(f);
+    rewind(f);
+
+    file = (i8 *)calloc(1, len + 1);
+    file[0] = '\0';
+    if (fread(file, 1, len, f) != len)
+    {
+      printf("Failed to read %ld bytes from file \"%s\".\n", len, filename);
+    }
+    file[len] = '\0';
+
+    fclose(f);
+  }
+
   while (true)
   {
     printf("> "); fflush(stdin);
     inputi++;
 
     char line[1024];
-    if (fgets(line, sizeof(line), stdin) == NULL)
-      return 0;
+    const char *input = NULL;
+    if (file)
+    {
+      input = file;
+    }
+    else
+    {
+      input = line;
+      if (fgets(line, sizeof(line), stdin) == NULL)
+        return 0;
+    }
 
+    /* parsing */
     TokenizerState tokenizer_state;
-
-    InitTokenizer(&tokenizer_state, line);
+    InitTokenizer(&tokenizer_state, input);
 
     InitParser(&tokenizer_state);
-    AstNode *node = ParseToplevel(&tokenizer_state);
-    PrintAstNode(node);
+    AstNode *root_node = ParseToplevel(&tokenizer_state);
+    PrintAstNode(root_node);
 
-    /* compile */
+    /* compilation */
+    cenv.code_begin = tokenizer_state.begin;
+    cenv.code_end = tokenizer_state.end;
+
+    CollectDeclarations(root_node, nullptr, &cenv, true);
+
+    int toplevel_return_type = InferTypes(root_node, nullptr, &cenv, true);
+
+    /* compile to LLVM IR */
     /* create module for this compilation unit */
-    snprintf(cenv.module_name, sizeof(cenv.module_name), "mod%02i", inputi);
-    snprintf(cenv.toplevel_function_name, sizeof(cenv.toplevel_function_name), "mod%02i_toplevel", inputi);
+    snprintf(cenv.module_name, sizeof(cenv.module_name), "m%03i", inputi);
+    snprintf(cenv.toplevel_function_name, sizeof(cenv.toplevel_function_name), "m%03i_toplevel", inputi);
 
-    /* init LLVM */
-    cenv.context = std::make_unique<LLVMContext>(); /* 1 obj per thread */
-    cenv.builder = new IRBuilder<>(*cenv.context);
-    cenv.mod = std::make_unique<Module>(cenv.module_name, *cenv.context);
+    /* init LLVM and create a module */
+    cenv.context = std::make_unique<llvm::LLVMContext>(); /* 1 obj per thread */
+    cenv.builder = new llvm::IRBuilder<>(*cenv.context);
+    cenv.mod = std::make_unique<llvm::Module>(cenv.module_name, *cenv.context);
 
     /* add existing function declarations */
     for (auto &a : cenv.function_declarations)
@@ -1101,32 +1761,26 @@ int main(int argc, char *argv[])
 
     FunctionDeclaration toplevel_function;
     strcpy(toplevel_function.name, cenv.toplevel_function_name);
-    toplevel_function.return_type = TYPE_I64;
+    toplevel_function.return_type = toplevel_return_type;
 
-    Function *f = AddFunctionDeclaration(&toplevel_function, cenv.context.get(), cenv.mod.get());
-    BasicBlock *block = BasicBlock::Create(*cenv.context, "body", f);
+    llvm::Function *f = AddFunctionDeclaration(&toplevel_function, cenv.context.get(), cenv.mod.get());
+    llvm::BasicBlock *block = llvm::BasicBlock::Create(*cenv.context, "", f);
     cenv.builder->SetInsertPoint(block);
 
-    Value *ret_val = GenerateIrList(node, NULL, true, &cenv);
+    llvm::Value *ret_val = GenerateIr(root_node, NULL, &cenv, true);
 
-    if (ret_val)
-    {
-      cenv.builder->CreateRet(ret_val);
-      verifyFunction(*f);
+    cenv.builder->CreateRet(ret_val);
+    llvm::verifyFunction(*f);
 
-      /* optimize code */
+    /* optimize code */
 #if 0
-      TheFPM->run(*f, *TheFAM);
+    TheFPM->run(*f, *TheFAM);
 #endif
-    }
-    else
-    {
-      cenv.builder->CreateRet(ConstantInt::get(Type::getInt64Ty(*cenv.context), 0, false));
-      verifyFunction(*f);
-    }
-    f->print(errs());
 
-    auto r1 = jit->get()->addIRModule(ThreadSafeModule(std::move(cenv.mod), std::move(cenv.context)));
+    cenv.mod->dump();
+
+    /* this will compile IR code in the module into machine code */
+    auto r1 = jit->get()->addIRModule(llvm::orc::ThreadSafeModule(std::move(cenv.mod), std::move(cenv.context)));
 
     for (auto &a : cenv.patches)
     {
@@ -1138,26 +1792,24 @@ int main(int argc, char *argv[])
         u64 addr1 = func_addr->getValue();
         u64 addr2 = func_addr2->getValue();
 
-        printf("addr1 0x%016llx\n", addr1);
-        printf("addr2 0x%016llx\n", addr2);
+        // printf("addr1 0x%016lx\n", addr1);
+        // printf("addr2 0x%016lx\n", addr2);
 
-        printf("[addr1] 0x%016llx\n", *(u64 *)addr1);
-        printf("[addr2] 0x%016llx\n", *(u64 *)addr2);
-
-        u8 *code = (u8 *)addr1;
+        // printf("[addr1] 0x%016lx\n", *(u64 *)addr1);
+        // printf("[addr2] 0x%016lx\n", *(u64 *)addr2);
 
         u64 map_addr = addr1 & ~(4096 -1);
+        u8 *code_mmap = (u8 *)mmap((void *)(map_addr), 4096, PROT_WRITE | PROT_READ | PROT_EXEC, MAP_FIXED | MAP_ANONYMOUS | MAP_SHARED, -1, 0);
 
-        u8 *code2 = (u8 *)mmap((void *)(map_addr), 4096, PROT_WRITE | PROT_READ | PROT_EXEC, MAP_FIXED | MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+        // printf("ptr (%p) %p\n", (void *)map_addr, code_mmap);
+        u8 *code_function = &code_mmap[addr1 - map_addr];
 
-        printf("ptr %p (%p) %p\n", code, (void *)map_addr, code2);
-#if 1
-        u8 *code3 = &code2[addr1 - map_addr];
-        code3[0] = 0xe9;
-        i32 diff = addr2 - addr1 - 5 /* jmp instruction length */;
-        memcpy(&code3[1], &diff, 4);
-#endif
+        /* diff - jump relative address */
+        i32 diff = (i64)addr2 - addr1 - 5 /* 5 = jmp instruction length */;
+        u64 temp = ((u64)diff << 8) & 0x000000ffffffff00ULL;
+        temp |= 0xe9 | 0x909090UL << 40; /* jmp rel32 instruction + nops */
 
+        *(u64 *)code_function = temp;
       }
       else
       {
@@ -1167,15 +1819,65 @@ int main(int argc, char *argv[])
     cenv.patches.clear();
 
     auto func_addr = jit->get()->lookup(cenv.toplevel_function_name);
+    printf("Toplevel func addr (%d) 0x%lx\n", func_addr ? 1 : 0, func_addr ? func_addr->getValue() : 0);
+
     if (func_addr)
     {
-      //i64 (*fun)() = func_addr->toPtr<i64()>();
-      i64 (*fun)() = (i64 (*)())func_addr->getValue();
-      i64 code_result = fun();
-      printf("Result = %ld\n", code_result);
+      switch (toplevel_return_type)
+      {
+        case TYPE_VOID:
+          {
+            ((void (*)())func_addr->getValue())();
+            printf("No result (void)\n");
+          }
+          break;
+        case TYPE_U64:
+        case TYPE_I64:
+          {
+            i64 code_result = ((i64 (*)())func_addr->getValue())();
+            printf("Result i64 = %ld\n", code_result);
+          }
+          break;
+        case TYPE_U32:
+        case TYPE_I32:
+          {
+            i32 code_result = ((i32 (*)())func_addr->getValue())();
+            printf("Result i32 = %d\n", code_result);
+          }
+          break;
+        case TYPE_U16:
+        case TYPE_I16:
+          {
+            i16 code_result = ((i16 (*)())func_addr->getValue())();
+            printf("Result i16 = %d\n", code_result);
+          }
+          break;
+        case TYPE_U8:
+        case TYPE_I8:
+          {
+            i8 code_result = ((i8 (*)())func_addr->getValue())();
+            printf("Result i8 = %d\n", code_result);
+          }
+          break;
+        case TYPE_F64:
+          {
+            double code_result = ((double (*)())func_addr->getValue())();
+            printf("Result f64 = %f\n", code_result);
+          }
+          break;
+        case TYPE_F32:
+          {
+            float code_result = ((float (*)())func_addr->getValue())();
+            printf("Result f32 = %f\n", code_result);
+          }
+          break;
+      }
     }
 
-    FreeAstNode(node);
+    FreeAstNode(root_node);
+
+    if (file)
+      break;
   }
 
   return 0;
