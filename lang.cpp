@@ -188,7 +188,6 @@ Token GetToken(TokenizerState *state)
 
     switch (c)
     {
-      case '#': state->state = STATE_COMMENT; break;
       case '"': state->state = STATE_STRING; break;
       case '=': t.type = TOK_EQUALS; state->it++; return t;
       case ',': t.type = TOK_COMMA; state->it++; return t;
@@ -203,7 +202,16 @@ Token GetToken(TokenizerState *state)
       case '+': t.type = TOK_PLUS; state->it++; return t;
       case '-': t.type = TOK_MINUS; state->it++; return t;
       case '*': t.type = TOK_TIMES; state->it++; return t;
-      case '/': t.type = TOK_DIV; state->it++; return t;
+      case '/': if ((state->it + 1 < state->end) && (state->it[1] == '/'))
+                {
+                  state->state = STATE_COMMENT;
+                  state->it += 2;
+                  break;
+                }
+                else
+                {
+                  t.type = TOK_DIV; state->it++; return t;
+                }
       default:
                 if (c >= '0' && c <= '9')
                 {
@@ -222,7 +230,6 @@ rescan:
     switch (state->state)
     {
       case STATE_COMMENT:
-        state->it++;
         while (state->it != state->end && *state->it != '\r' && *state->it != '\n')
           state->it++;
         break;
@@ -351,7 +358,7 @@ enum {
 };
 
 typedef enum {
-  TYPE_NONE = 0,
+  TYPE_UNKNOWN = 0,
   TYPE_I64,
   TYPE_U64,
   TYPE_F64,
@@ -440,7 +447,7 @@ void CodeError(const char *code_begin, const char *code_end, int pos, const char
     it++;
   }
 
-  fprintf(stderr, "ERROR: Line %d, column %d: %s", line, column + 1, tmp);
+  fprintf(stderr, "Line %d, column %d: %s", line, column + 1, tmp);
   fprintf(stderr, "%.*s\n", (int)(line_end - line_start), line_start);
   for (int i = 0; i < column; i++)
     fprintf(stderr, " ");
@@ -498,7 +505,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (!expr)
           {
-            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Error: Unexpected token\n");
             return NULL;
           }
 
@@ -515,7 +522,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
             {
               if (node->type != NODE_IDENTIFIER)
               {
-                CodeError(state->begin, state->end, node->token.pos, "In function definition argument must be a variable\n");
+                CodeError(state->begin, state->end, node->token.pos, "Error: In function definition argument must be a variable\n");
                 return NULL;
               }
             }
@@ -547,7 +554,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
 
           if (!node1)
           {
-            CodeError(state->begin, state->end, t1.pos, "Missing argument\n");
+            CodeError(state->begin, state->end, t1.pos, "Error: Missing argument\n");
             return NULL;
           }
           expr = MakeAstNode(NODE_NEGATE, t1);
@@ -560,7 +567,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (!expr)
           {
-            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Error: Unexpected token\n");
             return NULL;
           }
           AstNode *node1 = expr;
@@ -568,7 +575,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
 
           if (!node2)
           {
-            CodeError(state->begin, state->end, t1.pos, "Failed to parse second operand\n");
+            CodeError(state->begin, state->end, t1.pos, "Error: Failed to parse second operand\n");
             return NULL;
           }
           expr = MakeAstNode(t1.type == TOK_PLUS ? NODE_ADD :
@@ -582,7 +589,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         expr = ParseExpression(state, TOK_RIGHT_PAREN, -1, 0);
         if (!expr)
         {
-          CodeError(state->begin, state->end, t1.pos, "Empty parenthesis\n");
+          CodeError(state->begin, state->end, t1.pos, "Error: Empty parenthesis\n");
           return NULL;
         }
         else
@@ -595,7 +602,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (expr)
           {
-            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Error: Unexpected token\n");
             return NULL;
           }
 
@@ -606,7 +613,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (expr)
           {
-            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Error: Unexpected token\n");
             return NULL;
           }
 
@@ -617,7 +624,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (expr)
           {
-            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Error: Unexpected token\n");
             return NULL;
           }
 
@@ -628,7 +635,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         {
           if (expr)
           {
-            CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+            CodeError(state->begin, state->end, t1.pos, "Error: Unexpected token\n");
             return NULL;
           }
 
@@ -660,7 +667,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
           {
             if (expr)
             {
-              CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+              CodeError(state->begin, state->end, t1.pos, "Error: Unexpected token\n");
               return NULL;
             }
 
@@ -669,7 +676,7 @@ AstNode *ParseExpression(TokenizerState *state, int end_token, int end_token2, i
         }
         break;
       default:
-        CodeError(state->begin, state->end, t1.pos, "Unexpected token\n");
+        CodeError(state->begin, state->end, t1.pos, "Error: Unexpected token\n");
         return NULL;
         break;
     }
@@ -697,7 +704,7 @@ void ParseList(AstNode **node, TokenizerState *state, int separator, int end_tok
     }
     else if (t1.type == TOK_EOF)
     {
-      CodeError(state->begin, state->end, t1.pos, "Missing token\n");
+      CodeError(state->begin, state->end, t1.pos, "Error: Missing token\n");
       return;
     }
     else
@@ -730,7 +737,7 @@ void ParseBody(AstNode **node, TokenizerState *state)
     }
     else if (t1.type == TOK_EOF)
     {
-      CodeError(state->begin, state->end, t1.pos, "Missing token\n");
+      CodeError(state->begin, state->end, t1.pos, "Error: Missing token\n");
       return;
     }
     else
@@ -914,7 +921,7 @@ typedef struct {
 } TypeDescription;
 
 TypeDescription type_descriptions[] = {
-  { TYPE_NONE, "NONE", "none", 0, false, false, TYPE_NONE},
+  { TYPE_UNKNOWN, "UNKNOWN", "unknown", 0, false, false, TYPE_UNKNOWN},
   { TYPE_VOID, "VOID", "void", 0, false, false, TYPE_VOID},
   { TYPE_I64, "I64", "i64", 64, false, true, TYPE_U64},
   { TYPE_U64, "U64", "u64", 64, false, false, TYPE_I64},
@@ -933,7 +940,7 @@ const char *TypeToString(int type)
 {
   switch (type)
   {
-    case TYPE_NONE: return "NONE";
+    case TYPE_UNKNOWN: return "UNKNOWN";
     case TYPE_I64: return "I64";
     case TYPE_U64: return "U64";
     case TYPE_F64: return "F64";
@@ -959,7 +966,7 @@ int FindType(int bits, bool sign, bool floating_point)
       return type_descriptions[i].type;
   }
 
-  return TYPE_NONE;
+  return TYPE_UNKNOWN;
 }
 
 TypeDescription *FindTypeDescription(int type)
@@ -999,13 +1006,19 @@ typedef struct Scope {
   std::vector<VariableDefinition> variables;
 } Scope;
 
-typedef struct FunctionDeclaration {
+typedef struct FunctionInfo {
   char name[128];
+  int num_arguments;
+
+  bool has_types;
   int return_type;
   std::vector<int> arg_types;
-  int iteration;
-  int num_arguments;
-} FunctionDeclaration;
+
+  bool has_definition;
+  AstNode *definition;
+
+  int patch;
+} FunctionInfo;
 
 typedef struct GlobalVariableDef {
   char name[128];
@@ -1021,9 +1034,11 @@ typedef struct CompileEnvironment {
   char module_name[64];
   char toplevel_function_name[64];
 
-  std::vector<FunctionDeclaration> function_declarations;
+  std::vector<FunctionInfo *> functions;
   std::vector<GlobalVariableDef> global_variables;
 
+  /* data for current compilation */
+  std::vector<FunctionInfo *> functions_to_declare;
   std::vector<std::pair<char *, char *>> patches;
 
   // source code (for printing errors)
@@ -1049,21 +1064,11 @@ VariableDefinition *FindVariable(Scope *scope, const char *name)
   return NULL;
 }
 
-#if 0
-std::unique_ptr<FunctionPassManager> TheFPM;
-std::unique_ptr<LoopAnalysisManager> TheLAM;
-std::unique_ptr<FunctionAnalysisManager> TheFAM;
-std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
-std::unique_ptr<ModuleAnalysisManager> TheMAM;
-std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
-std::unique_ptr<StandardInstrumentations> TheSI;
-#endif
-
 llvm::Type *LlvmType(int type, llvm::LLVMContext *context)
 {
   switch (type)
   {
-    case TYPE_NONE:
+    case TYPE_UNKNOWN:
       return NULL;
       break;
     case TYPE_VOID:
@@ -1095,49 +1100,27 @@ llvm::Type *LlvmType(int type, llvm::LLVMContext *context)
   }
 }
 
-int LlvmToType(llvm::Type *type)
+llvm::Function *AddFunctionDeclarationToModule(const char *name, int return_type, std::vector<int> &arg_types, llvm::LLVMContext *context, llvm::Module *mod)
 {
-  if (type->isVoidTy())
-    return TYPE_VOID;
-  if (type->isDoubleTy())
-    return TYPE_F64;
-  if (type->isFloatTy())
-    return TYPE_F32;
-  if (type->isIntegerTy(64))
-    return TYPE_U64;
-  if (type->isIntegerTy(32))
-    return TYPE_U32;
-  if (type->isIntegerTy(16))
-    return TYPE_U16;
-  if (type->isIntegerTy(8))
-    return TYPE_U8;
-
-  return TYPE_NONE;
-}
-
-void PrintFunctionDeclaration(FunctionDeclaration *fun_decl)
-{
-  printf("Function: \"%s\" %s(", fun_decl->name, TypeToString(fun_decl->return_type));
-  for (int i = 0; i < fun_decl->arg_types.size(); i++)
+  printf("Adding function declaration to module: ");
   {
-    printf(i == 0 ? "%s" : " %s", TypeToString(fun_decl->arg_types[i]));
+    printf("Function: \"%s\" %s(", name, TypeToString(return_type));
+    for (int i = 0; i < arg_types.size(); i++)
+    {
+      printf(i == 0 ? "%s" : " %s", TypeToString(arg_types[i]));
+    }
+    printf(")\n");
   }
-  printf(")\n");
-}
-
-llvm::Function *AddFunctionDeclaration(FunctionDeclaration *fun_decl, llvm::LLVMContext *context, llvm::Module *mod)
-{
-  printf("Adding function declaration: ");
-  PrintFunctionDeclaration(fun_decl);
 
   std::vector<llvm::Type *> types;
-  for (auto &a : fun_decl->arg_types)
+  for (auto &a : arg_types)
   {
     types.push_back(LlvmType(a, context));
   }
-  llvm::FunctionType *ft = llvm::FunctionType::get(LlvmType(fun_decl->return_type, context), types, false);
-  //Function *f = mod->getFunction(node->function_name.string);
-  llvm::Function *f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fun_decl->name, *mod);
+
+  llvm::FunctionType *ft = llvm::FunctionType::get(LlvmType(return_type, context), types, false);
+
+  llvm::Function *f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, name, *mod);
 
   return f;
 }
@@ -1195,7 +1178,7 @@ int IdentifierToType(AstNode *arg)
         return specialization_type[i].type;
     }
   }
-  return TYPE_NONE;
+  return TYPE_UNKNOWN;
 }
 
 int FindByName(const void *data, int element_size, int count, int offset, const char *str)
@@ -1208,6 +1191,41 @@ int FindByName(const void *data, int element_size, int count, int offset, const 
   }
 
   return -1;
+}
+
+int FindByNamePtr(const void *data, int count, int offset, const char *str)
+{
+  const char *data8 = (const char *)data;
+  for (int i = 0; i < count; i++)
+  {
+    if (strcmp(data8 + i * sizeof(void *) + offset, str) == 0)
+      return i;
+  }
+
+  return -1;
+}
+
+FunctionInfo *FindFunction(CompileEnvironment *cenv, const char *name)
+{
+  //int idx = FindByNamePtr(&cenv->functions[0], cenv->functions.size(),
+      //offsetof(FunctionInfo, name), name);
+
+  int idx = -1;
+  for (int i = 0; i < cenv->functions.size(); i++)
+  {
+    if (strcmp(cenv->functions[i]->name, name) == 0)
+    {
+      idx = i;
+      break;
+    }
+  }
+
+  printf("FindFunction: Function %s - idx %d\n", name, idx);
+
+  if (idx >= 0)
+    return cenv->functions[idx];
+  else
+    return NULL;
 }
 
 // COMPILE PASSES
@@ -1231,6 +1249,7 @@ int CollectDeclarations(AstNode *node, Scope *scope, CompileEnvironment *cenv, b
         /* nothing to do */
         break;
       case NODE_ASSIGN:
+#if 0
         {
           const char *name = node->args->token.string;
 
@@ -1250,53 +1269,76 @@ int CollectDeclarations(AstNode *node, Scope *scope, CompileEnvironment *cenv, b
             }
           }
         }
+#endif
         break;
       case NODE_DECLARE:
         {
           AstNode *arg = node->args;
-          FunctionDeclaration fun_decl;
-          fun_decl.iteration = 0;
-          fun_decl.num_arguments = 0;
-          fun_decl.return_type = IdentifierToType(arg);
-          arg = arg->next;
-          strcpy(fun_decl.name, arg->token.string);
-          arg = arg->next;
-
-          for (; arg; arg = arg->next)
+          int return_type = IdentifierToType(arg);
+          if (return_type == TYPE_UNKNOWN)
           {
-            fun_decl.arg_types.push_back(IdentifierToType(arg));
-            fun_decl.num_arguments++;
+            CodeError(cenv->code_begin, cenv->code_end, arg->token.pos, "Error: Unknown type\n");
+            goto return_error;
           }
+          arg = arg->next;
+          const char *name = arg->token.string;
+          arg = arg->next;
 
-          printf("Adding function declaration: %s\n", fun_decl.name);
-          cenv->function_declarations.push_back(fun_decl);
+          FunctionInfo *fi = FindFunction(cenv, name);
+          if (fi)
+          {
+            CodeError(cenv->code_begin, cenv->code_end, node->token.pos, "Warning: Redeclaration of the function \"%s\"\n", name);
+            goto next_node;
+          }
+          else
+          {
+            fi = (FunctionInfo *)calloc(1, sizeof(FunctionInfo));
+            fi->has_types = true;
+
+            fi->patch = 0;
+            fi->return_type = return_type;
+            strcpy(fi->name, name);
+
+            for (; arg; arg = arg->next)
+            {
+              int type = IdentifierToType(arg);
+              if (type == TYPE_UNKNOWN)
+              {
+                CodeError(cenv->code_begin, cenv->code_end, arg->token.pos, "Error: Unknown type\n");
+                goto return_error;
+              }
+              fi->arg_types.push_back(type);
+              fi->num_arguments++;
+            }
+
+            printf("Adding function info && declaration: %s\n", fi->name);
+            cenv->functions.push_back(fi);
+            if (std::find(cenv->functions_to_declare.begin(),
+                  cenv->functions_to_declare.end(), fi) == cenv->functions_to_declare.end())
+              cenv->functions_to_declare.push_back(fi);
+          }
         }
         break;
       case NODE_FUNCTION_DEFINITION:
         {
-          bool found = false;
-          for (auto &a : cenv->function_declarations)
-          {
-            if (strcmp(a.name, node->function_name.string) == 0)
-            {
-              found = true;
-              break;
-            }
-          }
+          FunctionInfo *fi = FindFunction(cenv, node->function_name.string);
 
-          if (!found)
+          if (fi == nullptr)
           {
-            FunctionDeclaration fun_decl;
-            fun_decl.iteration = 0;
-            fun_decl.num_arguments = 0;
-            strcpy(fun_decl.name, node->function_name.string);
-
-            printf("Adding function definition: %s\n", fun_decl.name);
+            CodeError(cenv->code_begin, cenv->code_end, node->token.pos, "Error: Function doesn't have a declaration\n");
+            goto return_error;
+#if 0
+            FunctionInfo *fi = (FunctionInfo *)calloc(sizeof(FunctionInfo), 1);
+            fi->patch = 0;
+            fi->num_arguments = 0;
+            strcpy(fi->name, node->function_name.string);
 
             for (AstNode *arg = node->args; arg; arg = arg->next)
-              fun_decl.num_arguments++;
+              fi->num_arguments++;
 
-            cenv->function_declarations.push_back(fun_decl);
+            printf("Adding function info: %s\n", fi->name);
+            cenv->functions.push_back(fi);
+#endif
           }
         }
         break;
@@ -1305,6 +1347,7 @@ int CollectDeclarations(AstNode *node, Scope *scope, CompileEnvironment *cenv, b
         break;
     }
 
+next_node:
     if (!all)
       return return_value;
 
@@ -1314,6 +1357,9 @@ int CollectDeclarations(AstNode *node, Scope *scope, CompileEnvironment *cenv, b
     node = node->next;
   }
   return return_value;
+
+return_error:
+  return -1;
 }
 
 int InferTypes(AstNode *node, Scope *scope, CompileEnvironment *cenv, bool all)
@@ -1358,10 +1404,14 @@ int InferTypes(AstNode *node, Scope *scope, CompileEnvironment *cenv, bool all)
         break;
       case NODE_FUNCALL:
         {
+          /* infer types for the argument nodes */
           InferTypes(node->args, scope, cenv, true);
 
-          /* TODO return type of the function */
-          node->return_type = TYPE_I64;
+          FunctionInfo *fi = FindFunction(cenv, node->token.string);
+          if (fi)
+            node->return_type = fi->return_type;
+          else
+            node->return_type = TYPE_I64;
         }
         break;
       case NODE_ASSIGN:
@@ -1386,15 +1436,26 @@ int InferTypes(AstNode *node, Scope *scope, CompileEnvironment *cenv, bool all)
     node = node->next;
   }
 
-  return TYPE_NONE;
+  return TYPE_UNKNOWN;
 }
 
 
-llvm::Value *GenerateIr(AstNode *node, Scope *scope, CompileEnvironment *cenv, bool all)
+llvm::Value *GenerateIr(AstNode *node, Scope *scope, CompileEnvironment *cenv, bool all, bool definitions = false)
 {
   llvm::Value *return_value = nullptr;
   while (node)
   {
+    if (definitions && node->type != NODE_FUNCTION_DEFINITION)
+    {
+      if (!all)
+        return return_value;
+
+      if (!node->next)
+        return return_value;
+
+      node = node->next;
+    }
+
     switch (node->type)
     {
       case NODE_INTEGER:
@@ -1443,28 +1504,8 @@ llvm::Value *GenerateIr(AstNode *node, Scope *scope, CompileEnvironment *cenv, b
             break;
           }
 
-          CodeError(cenv->code_begin, cenv->code_end, node->token.pos, "Error - Variable \"%s\" not found\n", name);
+          CodeError(cenv->code_begin, cenv->code_end, node->token.pos, "Error: Variable \"%s\" not found\n", name);
           return NULL;
-        }
-        break;
-      case NODE_DECLARE:
-        {
-          AstNode *arg = node->args;
-          FunctionDeclaration fun_decl;
-          fun_decl.iteration = 0;
-          fun_decl.return_type = IdentifierToType(arg);
-          arg = arg->next;
-          strcpy(fun_decl.name, arg->token.string);
-          arg = arg->next;
-
-          for (; arg; arg = arg->next)
-          {
-            fun_decl.arg_types.push_back(IdentifierToType(arg));
-          }
-
-          cenv->function_declarations.push_back(fun_decl);
-
-          /*Function *f =*/ AddFunctionDeclaration(&fun_decl, cenv->context.get(), cenv->mod.get());
         }
         break;
       case NODE_FUNCALL:
@@ -1478,26 +1519,15 @@ llvm::Value *GenerateIr(AstNode *node, Scope *scope, CompileEnvironment *cenv, b
           llvm::Function *f = cenv->mod->getFunction(node->token.string);
           if (!f)
           {
-#if 1
-            FunctionDeclaration fun_decl;
-            strcpy(fun_decl.name, node->token.string);
-            fun_decl.return_type = TYPE_I64;
+            FunctionInfo *fi = (FunctionInfo *)calloc(1, sizeof(FunctionInfo));
+            strcpy(fi->name, node->token.string);
+            fi->return_type = TYPE_I64;
             for (AstNode *arg = node->args; arg; arg = arg->next)
             {
-              fun_decl.arg_types.push_back(arg->return_type);
+              fi->arg_types.push_back(arg->return_type);
             }
 
-            f = AddFunctionDeclaration(&fun_decl, cenv->context.get(), cenv->mod.get());
-#else
-            std::vector<Type *> types;
-            for (auto &a : args)
-            {
-              types.push_back(a->getType());
-            }
-
-            FunctionType *ft = FunctionType::get(LlvmType(TYPE_I64, cenv->context.get()), types, false);
-            f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, node->token.string, *cenv->mod);
-#endif
+            f = AddFunctionDeclarationToModule(fi->name, fi->return_type, fi->arg_types, cenv->context.get(), cenv->mod.get());
           }
           if (f)
           {
@@ -1510,35 +1540,84 @@ llvm::Value *GenerateIr(AstNode *node, Scope *scope, CompileEnvironment *cenv, b
           }
         }
         break;
+      case NODE_DECLARE:
+        /* don't generate instructions */
+        break;
       case NODE_FUNCTION_DEFINITION:
+        if (definitions)
         {
-          FunctionDeclaration fun_decl;
-          fun_decl.iteration = 0;
-          strcpy(fun_decl.name, node->function_name.string);
-          for (auto &a : cenv->function_declarations)
+          const char *name = node->function_name.string;
+          FunctionInfo *fi = nullptr;
+          FunctionInfo *fi2 = FindFunction(cenv, name);
+          if (fi2)
           {
-            if (strcmp(a.name, node->function_name.string) == 0)
+            if (fi2->has_definition)
             {
-              snprintf(fun_decl.name, sizeof(fun_decl.name), "%s_%d", node->function_name.string, a.iteration++);
-              cenv->patches.push_back(std::make_pair(strdup(a.name), strdup(fun_decl.name)));
-              break;
+              /* this definition is a patch of an existing implementation */
+              fi = (FunctionInfo *)calloc(1, sizeof(FunctionInfo));
+              snprintf(fi->name, sizeof(fi->name), "%s_%d", name, fi2->patch++);
+              fi->num_arguments = fi2->num_arguments;
+              fi->has_types = fi2->has_types;
+              fi->return_type = fi2->return_type;
+              fi->arg_types = fi2->arg_types;
+              fi->has_definition = fi2->has_definition;
+
+              //fi->definition = node;
+
+              fi->patch = 0;
+
+              cenv->patches.push_back(std::make_pair(strdup(fi2->name), strdup(fi->name)));
+            }
+            else
+            {
+              fi = fi2;
             }
           }
-          fun_decl.return_type = TYPE_I64;
 
-          for (AstNode *arg = node->args; arg; arg = arg->next)
+          if (!fi)
           {
-            //types.push_back(llvm::Type::getInt64Ty(*cenv->context));
-            fun_decl.arg_types.push_back(TYPE_I64);
-          }
-          //FunctionType *ft = llvm::FunctionType::get(llvm::Type::getInt64Ty(*cenv->context) /*return*/, types, false);
-          //Function *f = cenv->mod->getFunction(node->function_name.string);
 
-          llvm::Function *f = AddFunctionDeclaration(&fun_decl, cenv->context.get(), cenv->mod.get());
+            CodeError(cenv->code_begin, cenv->code_end, node->token.pos, "Error: Function \"%s\" declaration doesn't exist\n", name);
+            return NULL;
+#if 0
+            /* no declaration od definition yet */
+            /* provide default types */
+            fi = (FunctionInfo *)calloc(1, sizeof(FunctionInfo));
+            fi->patch = 0;
+            strcpy(fi->name, name);
+            fi->return_type = TYPE_I64;
+
+            for (AstNode *arg = node->args; arg; arg = arg->next)
+            {
+              fi->arg_types.push_back(TYPE_I64);
+            }
+#endif
+          }
+
+          if (!fi->has_definition)
+          {
+            fi->has_definition = true;
+            fi->definition = node;
+            printf("Adding definition for function \"%s\"\n", name);
+          }
+
+          /* compile */
+          /* find existing declaration in this module if present */
+          llvm::Function *f = cenv->mod.get()->getFunction(fi->name);
+          if (!f)
+          {
+            /* function is declared in a previous module */
+            f = AddFunctionDeclarationToModule(fi->name, fi->return_type, fi->arg_types,
+                cenv->context.get(), cenv->mod.get());
+          }
+          if (!f)
+          {
+            printf("%d: Something went wrong!\n", __LINE__);
+          }
           llvm::BasicBlock *block = llvm::BasicBlock::Create(*cenv->context, "", f);
           auto previous_insert = cenv->builder->saveIP();
           cenv->builder->SetInsertPoint(block);
-          cenv->function_declarations.push_back(fun_decl);
+          cenv->functions.push_back(fi);
 
           Scope s;
           {
@@ -1561,19 +1640,13 @@ llvm::Value *GenerateIr(AstNode *node, Scope *scope, CompileEnvironment *cenv, b
 
           /* generate IR for the function body */
           llvm::Value *ret_val = GenerateIr(node->args2, &s, cenv, true);
-          if (ret_val)
-          {
-            cenv->builder->CreateRet(ret_val);
-            llvm::verifyFunction(*f);
-
-            /* optimize code */
-#if 0
-            TheFPM->run(*f, *TheFAM);
-#endif
-          }
-          f->print(llvm::errs());
+          cenv->builder->CreateRet(ret_val); /* can be null */
+          llvm::verifyFunction(*f);
           cenv->builder->restoreIP(previous_insert);
-
+        }
+        else
+        {
+          return_value = nullptr; /* void */
         }
         break;
       case NODE_ASSIGN:
@@ -1641,6 +1714,43 @@ extern "C" int LoadLibrary(const char *library_file)
   return 0;
 }
 
+bool PatchFunctions(llvm::orc::LLJIT *jit, const char *name1, const char *name2)
+{
+  auto func_addr = jit->lookup(name1);
+  auto func_addr2 = jit->lookup(name2);
+  if (func_addr && func_addr2)
+  {
+    u64 addr1 = func_addr->getValue();
+    u64 addr2 = func_addr2->getValue();
+
+    // printf("addr1 0x%016lx\n", addr1);
+    // printf("addr2 0x%016lx\n", addr2);
+
+    // printf("[addr1] 0x%016lx\n", *(u64 *)addr1);
+    // printf("[addr2] 0x%016lx\n", *(u64 *)addr2);
+
+    u64 map_addr = addr1 & ~(4096 -1);
+    u8 *code_mmap = (u8 *)mmap((void *)(map_addr), 4096, PROT_WRITE | PROT_READ | PROT_EXEC, MAP_FIXED | MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+
+    // printf("ptr (%p) %p\n", (void *)map_addr, code_mmap);
+    u8 *code_function = &code_mmap[addr1 - map_addr];
+
+    /* diff - jump relative address */
+    i32 diff = (i64)addr2 - addr1 - 5 /* 5 = jmp instruction length */;
+    u64 temp = ((u64)diff << 8) & 0x000000ffffffff00ULL;
+    temp |= 0xe9 | 0x909090UL << 40; /* jmp rel32 instruction + nops */
+
+    *(u64 *)code_function = temp;
+  }
+  else
+  {
+    printf("Patching: Failed to get function addresses for %s and %s\n", name1, name2);
+    return false;
+  }
+
+  return true;
+}
+
 int main(int argc, char *argv[])
 {
   llvm::InitLLVM raii_1(argc, argv); /* helper class for stacktrace, utf-8 argv etc. */
@@ -1649,6 +1759,11 @@ int main(int argc, char *argv[])
   llvm::InitializeNativeTargetAsmPrinter();
 
   auto jit = llvm::orc::LLJITBuilder().create();
+  if (!jit)
+  {
+    fprintf(stderr, "Failed to create a LLJIT object.\n");
+    exit(EXIT_FAILURE);
+  }
 
   /* optimization passes */
 #if 0
@@ -1698,7 +1813,7 @@ int main(int argc, char *argv[])
     i64 len = ftell(f);
     rewind(f);
 
-    file = (i8 *)calloc(1, len + 1);
+    file = (i8 *)calloc(len + 1, 1);
     file[0] = '\0';
     if (fread(file, 1, len, f) != len)
     {
@@ -1709,9 +1824,15 @@ int main(int argc, char *argv[])
     fclose(f);
   }
 
+  AstNode *full_ast = nullptr;
+  AstNode *full_ast_last = nullptr;
+
   while (true)
   {
-    printf("> "); fflush(stdin);
+    if (!file)
+    {
+      printf("> "); fflush(stdin);
+    }
     inputi++;
 
     char line[1024];
@@ -1733,152 +1854,157 @@ int main(int argc, char *argv[])
 
     InitParser(&tokenizer_state);
     AstNode *root_node = ParseToplevel(&tokenizer_state);
+    if (!root_node)
+      goto next_input;
+
     PrintAstNode(root_node);
 
     /* compilation */
     cenv.code_begin = tokenizer_state.begin;
     cenv.code_end = tokenizer_state.end;
 
-    CollectDeclarations(root_node, nullptr, &cenv, true);
-
-    int toplevel_return_type = InferTypes(root_node, nullptr, &cenv, true);
-
-    /* compile to LLVM IR */
-    /* create module for this compilation unit */
-    snprintf(cenv.module_name, sizeof(cenv.module_name), "m%03i", inputi);
-    snprintf(cenv.toplevel_function_name, sizeof(cenv.toplevel_function_name), "m%03i_toplevel", inputi);
-
-    /* init LLVM and create a module */
-    cenv.context = std::make_unique<llvm::LLVMContext>(); /* 1 obj per thread */
-    cenv.builder = new llvm::IRBuilder<>(*cenv.context);
-    cenv.mod = std::make_unique<llvm::Module>(cenv.module_name, *cenv.context);
-
-    /* add existing function declarations */
-    for (auto &a : cenv.function_declarations)
+    if (CollectDeclarations(root_node, nullptr, &cenv, true) == -1)
     {
-      AddFunctionDeclaration(&a, cenv.context.get(), cenv.mod.get());
+      /* error - can't continue */
+      FreeAstNode(root_node);
+      goto next_input;
     }
 
-    FunctionDeclaration toplevel_function;
-    strcpy(toplevel_function.name, cenv.toplevel_function_name);
-    toplevel_function.return_type = toplevel_return_type;
-
-    llvm::Function *f = AddFunctionDeclaration(&toplevel_function, cenv.context.get(), cenv.mod.get());
-    llvm::BasicBlock *block = llvm::BasicBlock::Create(*cenv.context, "", f);
-    cenv.builder->SetInsertPoint(block);
-
-    llvm::Value *ret_val = GenerateIr(root_node, NULL, &cenv, true);
-
-    cenv.builder->CreateRet(ret_val);
-    llvm::verifyFunction(*f);
-
-    /* optimize code */
-#if 0
-    TheFPM->run(*f, *TheFAM);
-#endif
-
-    cenv.mod->dump();
-
-    /* this will compile IR code in the module into machine code */
-    auto r1 = jit->get()->addIRModule(llvm::orc::ThreadSafeModule(std::move(cenv.mod), std::move(cenv.context)));
-
-    for (auto &a : cenv.patches)
     {
-      printf("Patching %s -> %s\n", a.first, a.second);
-      auto func_addr = jit->get()->lookup(a.first);
-      auto func_addr2 = jit->get()->lookup(a.second);
-      if (func_addr && func_addr2)
+      //int toplevel_return_type = InferTypes(root_node, nullptr, &cenv, true);
+      int toplevel_return_type = TYPE_I64; //InferTypes(root_node, nullptr, &cenv, true);
+
+      /* compile AST to LLVM IR */
+      /* create module for this compilation unit */
+      snprintf(cenv.module_name, sizeof(cenv.module_name), "m%03i", inputi);
+      snprintf(cenv.toplevel_function_name, sizeof(cenv.toplevel_function_name), "m%03i_toplevel", inputi);
+
+      /* init LLVM and create a module */
+      cenv.context = std::make_unique<llvm::LLVMContext>(); /* 1 obj per thread */
+      cenv.builder = new llvm::IRBuilder<>(*cenv.context);
+      cenv.mod = std::make_unique<llvm::Module>(cenv.module_name, *cenv.context);
+
+      /* add function declarations */
+      /* after all function declarations are added for this module
+       * function definitions can be added in an arbitrary order (LLVM is similar to C file) */
+      for (auto &fi : cenv.functions_to_declare)
       {
-        u64 addr1 = func_addr->getValue();
-        u64 addr2 = func_addr2->getValue();
+        AddFunctionDeclarationToModule(fi->name, fi->return_type, fi->arg_types,
+            cenv.context.get(), cenv.mod.get());
+      }
+      cenv.functions_to_declare.clear();
 
-        // printf("addr1 0x%016lx\n", addr1);
-        // printf("addr2 0x%016lx\n", addr2);
+      /* compile function definitions first */
+      /*llvm::Value *ret_val1 = */GenerateIr(root_node, NULL, &cenv, true, true);
 
-        // printf("[addr1] 0x%016lx\n", *(u64 *)addr1);
-        // printf("[addr2] 0x%016lx\n", *(u64 *)addr2);
+      /* compile toplevel code (add function definitions and toplevel function definition) */
+      std::vector<int> empty_vector;
+      llvm::Function *f = AddFunctionDeclarationToModule(cenv.toplevel_function_name, toplevel_return_type,
+          empty_vector, cenv.context.get(), cenv.mod.get());
+      llvm::BasicBlock *block = llvm::BasicBlock::Create(*cenv.context, "", f);
+      cenv.builder->SetInsertPoint(block);
 
-        u64 map_addr = addr1 & ~(4096 -1);
-        u8 *code_mmap = (u8 *)mmap((void *)(map_addr), 4096, PROT_WRITE | PROT_READ | PROT_EXEC, MAP_FIXED | MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+      llvm::Value *ret_val = GenerateIr(root_node, NULL, &cenv, true, false);
 
-        // printf("ptr (%p) %p\n", (void *)map_addr, code_mmap);
-        u8 *code_function = &code_mmap[addr1 - map_addr];
+      cenv.builder->CreateRet(ret_val);
+      llvm::verifyFunction(*f);
 
-        /* diff - jump relative address */
-        i32 diff = (i64)addr2 - addr1 - 5 /* 5 = jmp instruction length */;
-        u64 temp = ((u64)diff << 8) & 0x000000ffffffff00ULL;
-        temp |= 0xe9 | 0x909090UL << 40; /* jmp rel32 instruction + nops */
+      /* print module */
+      cenv.mod->dump();
 
-        *(u64 *)code_function = temp;
+      /* this will compile IR code in the module into machine code */
+      auto r1 = jit->get()->addIRModule(llvm::orc::ThreadSafeModule(std::move(cenv.mod), std::move(cenv.context)));
+
+      /* patch functions */
+      for (auto &a : cenv.patches)
+      {
+        printf("Patching %s -> %s\n", a.first, a.second);
+        PatchFunctions(jit->get(), a.first, a.second);
+        free(a.first);
+        free(a.second);
+      }
+      cenv.patches.clear();
+
+      auto func_addr = jit->get()->lookup(cenv.toplevel_function_name);
+      printf("Toplevel func addr (%d) 0x%lx\n", func_addr ? 1 : 0, func_addr ? func_addr->getValue() : 0);
+
+      if (func_addr)
+      {
+        switch (toplevel_return_type)
+        {
+          case TYPE_VOID:
+            {
+              ((void (*)())func_addr->getValue())();
+              printf("No result (void)\n");
+            }
+            break;
+          case TYPE_U64:
+          case TYPE_I64:
+            {
+              i64 code_result = ((i64 (*)())func_addr->getValue())();
+              printf("Result i64 = %ld\n", code_result);
+            }
+            break;
+          case TYPE_U32:
+          case TYPE_I32:
+            {
+              i32 code_result = ((i32 (*)())func_addr->getValue())();
+              printf("Result i32 = %d\n", code_result);
+            }
+            break;
+          case TYPE_U16:
+          case TYPE_I16:
+            {
+              i16 code_result = ((i16 (*)())func_addr->getValue())();
+              printf("Result i16 = %d\n", code_result);
+            }
+            break;
+          case TYPE_U8:
+          case TYPE_I8:
+            {
+              i8 code_result = ((i8 (*)())func_addr->getValue())();
+              printf("Result i8 = %d\n", code_result);
+            }
+            break;
+          case TYPE_F64:
+            {
+              double code_result = ((double (*)())func_addr->getValue())();
+              printf("Result f64 = %f\n", code_result);
+            }
+            break;
+          case TYPE_F32:
+            {
+              float code_result = ((float (*)())func_addr->getValue())();
+              printf("Result f32 = %f\n", code_result);
+            }
+            break;
+        }
+      }
+
+      /* append AstNodes in root_node to full_ast */
+      if (full_ast)
+      {
+        full_ast_last->next = root_node;
+        while (full_ast_last->next)
+          full_ast_last = full_ast_last->next;
       }
       else
       {
-        printf("Failed to get function addresses\n");
-      }
-    }
-    cenv.patches.clear();
-
-    auto func_addr = jit->get()->lookup(cenv.toplevel_function_name);
-    printf("Toplevel func addr (%d) 0x%lx\n", func_addr ? 1 : 0, func_addr ? func_addr->getValue() : 0);
-
-    if (func_addr)
-    {
-      switch (toplevel_return_type)
-      {
-        case TYPE_VOID:
-          {
-            ((void (*)())func_addr->getValue())();
-            printf("No result (void)\n");
-          }
-          break;
-        case TYPE_U64:
-        case TYPE_I64:
-          {
-            i64 code_result = ((i64 (*)())func_addr->getValue())();
-            printf("Result i64 = %ld\n", code_result);
-          }
-          break;
-        case TYPE_U32:
-        case TYPE_I32:
-          {
-            i32 code_result = ((i32 (*)())func_addr->getValue())();
-            printf("Result i32 = %d\n", code_result);
-          }
-          break;
-        case TYPE_U16:
-        case TYPE_I16:
-          {
-            i16 code_result = ((i16 (*)())func_addr->getValue())();
-            printf("Result i16 = %d\n", code_result);
-          }
-          break;
-        case TYPE_U8:
-        case TYPE_I8:
-          {
-            i8 code_result = ((i8 (*)())func_addr->getValue())();
-            printf("Result i8 = %d\n", code_result);
-          }
-          break;
-        case TYPE_F64:
-          {
-            double code_result = ((double (*)())func_addr->getValue())();
-            printf("Result f64 = %f\n", code_result);
-          }
-          break;
-        case TYPE_F32:
-          {
-            float code_result = ((float (*)())func_addr->getValue())();
-            printf("Result f32 = %f\n", code_result);
-          }
-          break;
+        full_ast = full_ast_last = root_node;
+        while (full_ast_last->next)
+          full_ast_last = full_ast_last->next;
       }
     }
 
-    FreeAstNode(root_node);
 
+    //printf("Full AST\n");
+    //PrintAstNode(full_ast);
+next_input:
     if (file)
       break;
   }
+
+  FreeAstNode(full_ast);
 
   return 0;
 }
