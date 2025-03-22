@@ -1,5 +1,17 @@
-PARAM := `llvm-config --cxxflags --ldflags --libs core` -rdynamic -Wl,--export-dynamic
+CXXFLAGS := -O0 -g3 -Wall `llvm-config --cxxflags`
+LD_FLAGS := `llvm-config --ldflags --libs core` -rdynamic -Wl,--export-dynamic
 
-.PHONY: lang
-lang:
-	clang++ -g3 -o $@ -Wall ${PARAM} lang.cpp
+EXE_NAME = lang
+
+OBJS := parser.o compiler.o main.o
+
+%.o: %.cpp
+	clang++ ${CXXFLAGS} -c $<
+
+$(EXE_NAME): $(OBJS)
+	clang++ ${LD_FLAGS} -o $@ $(OBJS)
+
+.PHONY: clean
+clean:
+	rm -f $(OBJS)
+	rm -f $(EXE_NAME)
